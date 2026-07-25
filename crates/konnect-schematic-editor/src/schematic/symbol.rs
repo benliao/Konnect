@@ -165,6 +165,11 @@ impl Symbol {
     pub fn set_footprint(&mut self, v: &str) {
         self.set_property("Footprint", v);
     }
+    /// Position of a named property's text, if it carries an `(at …)`.
+    pub fn property_position(&self, name: &str) -> Option<(f64, f64)> {
+        self.properties.iter().find(|p| p.name == name)?.position()
+    }
+
     pub fn set_datasheet(&mut self, v: &str) {
         self.set_property("Datasheet", v);
     }
@@ -259,18 +264,53 @@ impl Symbol {
         (self.at.x, self.at.y)
     }
 
+    /// Move the symbol, carrying its Reference/Value/Footprint text with it.
+    ///
+    /// Field positions are absolute in KiCAD, not relative to the symbol, so
+    /// moving only `self.at` leaves every field's text behind at the old
+    /// location — after a bulk move the designators end up scattered across the
+    /// sheet, disconnected from the parts they label.
     pub fn move_to(&mut self, x: f64, y: f64) {
-        self.at.x = x;
-        self.at.y = y;
+        self.translate(x - self.at.x, y - self.at.y);
     }
 
     pub fn translate(&mut self, dx: f64, dy: f64) {
         self.at.x += dx;
         self.at.y += dy;
+        for prop in &mut self.properties {
+            if let Some((px, py)) = prop.position() {
+                prop.set_position(px + dx, py + dy);
+            }
+        }
     }
 
+    /// Set the symbol's rotation, rotating its field text about the symbol
+    /// origin by the same delta.
+    ///
+    /// A field at offset `o` from the symbol origin moves to `origin + R(Δθ)·o`.
+    ///
+    /// The field's own angle is left alone. That is measured behaviour, not an
+    /// assumption: across eeschema-written sheets, the same library symbol at
+    /// 0° and at 90° keeps an identical field angle while its offset rotates —
+    /// `power:+5V` goes from `(0, 3.81)` to `(3.81, 0)` with angle `0` in both,
+    /// and `CM5IO:R` keeps angle `90` in both. Rewriting the angle here would
+    /// diverge from what KiCAD itself produces.
     pub fn set_rotation(&mut self, rot: f64) {
+        let delta = rot - self.at.rotation.unwrap_or(0.0);
         self.at.rotation = Some(rot);
+        if delta.abs() < f64::EPSILON {
+            return;
+        }
+        // KiCAD's schematic Y axis points down, so a positive (counter-
+        // clockwise) symbol rotation is clockwise in raw coordinates.
+        let (sin, cos) = (-delta).to_radians().sin_cos();
+        let (ox, oy) = (self.at.x, self.at.y);
+        for prop in &mut self.properties {
+            if let Some((px, py)) = prop.position() {
+                let (dx, dy) = (px - ox, py - oy);
+                prop.set_position(ox + dx * cos - dy * sin, oy + dx * sin + dy * cos);
+            }
+        }
     }
 }
 
@@ -448,3 +488,78 @@ fn dist(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
     (dx * dx + dy * dy).sqrt()
 }
 
+
+#[cfg(test)]
+mod field_transform_tests {
+    use super::*;
+    use crate::sexp::parser;
+
+    /// A symbol at (100, 100) whose Reference text sits 5mm above it.
+    fn sym_at(x: f64, y: f64, rot: f64) -> Symbol {
+        let text = format!(
+            "(symbol\n\t(lib_id \"Device:R\")\n\t(at {x} {y} {rot})\n\t(unit 1)\n\t\
+             (property \"Reference\" \"R3\"\n\t\t(at {x} {} 0)\n\t)\n\t\
+             (property \"Value\" \"10k\"\n\t\t(at {x} {} 0)\n\t)\n)",
+            y + 5.0,
+            y + 8.0
+        );
+        Symbol::from_sexp(&parser::parse(&text).unwrap()).unwrap()
+    }
+
+    /// Field positions are absolute; moving only the symbol used to strand
+    /// every designator at its old spot.
+    #[test]
+    fn moving_carries_the_field_text() {
+        let mut s = sym_at(100.0, 100.0, 0.0);
+        s.move_to(330.2, 196.85);
+
+        assert_eq!(s.at.x, 330.2);
+        let (rx, ry) = s.property_position("Reference").unwrap();
+        assert!((rx - 330.2).abs() < 1e-6, "x not carried: {rx}");
+        // The 5mm offset below the symbol is preserved.
+        assert!((ry - 201.85).abs() < 1e-6, "y not carried: {ry}");
+    }
+
+    #[test]
+    fn translating_carries_the_field_text() {
+        let mut s = sym_at(10.0, 20.0, 0.0);
+        s.translate(2.54, -1.27);
+        let (rx, ry) = s.property_position("Reference").unwrap();
+        assert!((rx - 12.54).abs() < 1e-6 && (ry - 23.73).abs() < 1e-6, "{rx},{ry}");
+    }
+
+    /// Matches eeschema's measured behaviour: a field at offset (0, +d) at 0°
+    /// sits at (+d, 0) at 90°, and its own text angle is unchanged. Verified
+    /// against real sheets — power:+5V goes (0, 3.81) -> (3.81, 0), angle 0
+    /// both times.
+    #[test]
+    fn rotating_moves_fields_the_way_eeschema_does() {
+        let mut s = sym_at(100.0, 100.0, 0.0);
+        s.set_rotation(90.0);
+
+        let (rx, ry) = s.property_position("Reference").unwrap();
+        assert!((rx - 105.0).abs() < 1e-6, "x: {rx}");
+        assert!((ry - 100.0).abs() < 1e-6, "y: {ry}");
+
+        let angle = s
+            .properties
+            .iter()
+            .find(|p| p.name == "Reference")
+            .and_then(|p| p.text_angle())
+            .unwrap();
+        assert_eq!(angle, 0.0, "eeschema leaves the field angle alone");
+    }
+
+    #[test]
+    fn rotating_back_to_zero_restores_the_original_layout() {
+        let mut s = sym_at(100.0, 100.0, 0.0);
+        let before = s.property_position("Reference").unwrap();
+        s.set_rotation(180.0);
+        s.set_rotation(0.0);
+        let after = s.property_position("Reference").unwrap();
+        assert!(
+            (before.0 - after.0).abs() < 1e-6 && (before.1 - after.1).abs() < 1e-6,
+            "{before:?} != {after:?}"
+        );
+    }
+}

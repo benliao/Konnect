@@ -81,6 +81,11 @@ impl SexpNode {
         self.args().iter().filter_map(|c| c.text()).collect()
     }
 
+    /// The n-th child (0 = tag) parsed as f64.
+    pub fn get_float_at(&self, n: usize) -> Option<f64> {
+        self.children().get(n)?.text()?.parse().ok()
+    }
+
     pub fn float_value(&self) -> Option<f64> {
         self.value()?.parse().ok()
     }

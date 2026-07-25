@@ -404,6 +404,41 @@ fn cse_wires_to_sexp(sch: &cse::Schematic) -> Vec<konnect_sexp::schematic::Wire>
         .collect()
 }
 
+// ─── Junction maintenance ────────────────────────────────────────────────────
+
+/// Quantise a coordinate to 1 nm so junction positions de-duplicate exactly
+/// rather than by float comparison.
+fn round_key(v: f64) -> i64 {
+    (v * 1e6).round() as i64
+}
+
+/// Add a junction dot at every T-intersection that does not already have one.
+///
+/// Returns how many were added. Callers must run this ONCE after all wires are
+/// in place. Re-running the scan per wire and appending unconditionally — which
+/// every wire-adding path used to do — grows the junction count quadratically:
+/// 132 wires produced 2293 junctions where 26 were needed, and a single
+/// `add_wire` on a sheet with 26 junctions doubled it to 52.
+fn sync_junctions(sch: &mut cse::Schematic) -> usize {
+    let mut seen: std::collections::HashSet<(i64, i64)> = sch
+        .junctions
+        .iter()
+        .map(|j| {
+            let (x, y) = j.position();
+            (round_key(x), round_key(y))
+        })
+        .collect();
+
+    let mut added = 0usize;
+    for (jx, jy) in find_t_junctions(&cse_wires_to_sexp(sch), 0.01) {
+        if seen.insert((round_key(jx), round_key(jy))) {
+            sch.add_junction(jx, jy);
+            added += 1;
+        }
+    }
+    added
+}
+
 // ─── Wire insertion with T-junction detection ─────────────────────────────────
 
 fn insert_wire_with_junctions(content: String, x1: f64, y1: f64, x2: f64, y2: f64) -> String {
@@ -421,12 +456,26 @@ fn insert_wire_with_junctions(content: String, x1: f64, y1: f64, x2: f64, y2: f6
     };
     existing_wires.push(new_wire);
 
-    let junctions = find_t_junctions(&existing_wires, 0.01);
+    // Junctions already on the sheet, so an existing dot is not duplicated.
+    let existing_junctions: std::collections::HashSet<(i64, i64)> = tree
+        .as_ref()
+        .map(|t| {
+            t.find_all("junction")
+                .iter()
+                .filter_map(|j| {
+                    let at = j.find("at")?;
+                    Some((round_key(at.get_f64(1)?), round_key(at.get_f64(2)?)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut c = content;
     c = insert_before_close(&c, &format_wire(x1, y1, x2, y2));
-    for (jx, jy) in junctions {
-        c = insert_before_close(&c, &format_junction(jx, jy));
+    for (jx, jy) in find_t_junctions(&existing_wires, 0.01) {
+        if !existing_junctions.contains(&(round_key(jx), round_key(jy))) {
+            c = insert_before_close(&c, &format_junction(jx, jy));
+        }
     }
     c
 }
@@ -469,12 +518,10 @@ async fn handle_add_wire(
         y2,
         uuid: None,
     });
-    let junctions = find_t_junctions(&existing_wires, 0.01);
-
+    let _ = &existing_wires;
     sch.add_wire(x1, y1, x2, y2);
-    for (jx, jy) in &junctions {
-        sch.add_junction(*jx, *jy);
-    }
+    let added_junctions = sync_junctions(&mut sch);
+    let _ = added_junctions;
     sch.overwrite()?;
 
     Ok(CallToolResult::json(
@@ -499,27 +546,23 @@ async fn handle_batch_add_wire(
         let y2 = w["y2"].as_f64().unwrap_or(0.0);
         let (x1, y1) = snap_point(x1, y1, 1.27);
         let (x2, y2) = snap_point(x2, y2, 1.27);
-
-        // T-junction detection for each wire added incrementally
-        let mut existing_wires = cse_wires_to_sexp(&sch);
-        existing_wires.push(konnect_sexp::schematic::Wire {
-            x1,
-            y1,
-            x2,
-            y2,
-            uuid: None,
-        });
-        let junctions = find_t_junctions(&existing_wires, 0.01);
-
         sch.add_wire(x1, y1, x2, y2);
-        for (jx, jy) in &junctions {
-            sch.add_junction(*jx, *jy);
-        }
         added += 1;
     }
 
+    // Detect T-junctions ONCE, over the finished wire set.
+    //
+    // This used to run inside the loop and re-add *every* junction found so
+    // far on each iteration, so junction count grew quadratically with the
+    // batch: 132 wires produced 2293 junctions where 26 were needed, tripling
+    // the file size. Junctions already on the sheet are skipped too, so
+    // repeated batches stay idempotent.
+    let added_junctions = sync_junctions(&mut sch);
+
     sch.overwrite()?;
-    Ok(CallToolResult::json(&json!({ "added_wires": added })))
+    Ok(CallToolResult::json(
+        &json!({ "added_wires": added, "added_junctions": added_junctions }),
+    ))
 }
 
 async fn handle_delete_wire(
@@ -529,14 +572,60 @@ async fn handle_delete_wire(
     let sch_path = get_path(args, "schematic")?;
     let content = std::fs::read_to_string(&sch_path)?;
 
-    let search_str = if let Some(uuid) = opt_str(args, "uuid") {
-        format!(r#"(uuid "{uuid}")"#)
-    } else {
-        let x1 = opt_f64(args, "x1").unwrap_or(0.0);
-        let y1 = opt_f64(args, "y1").unwrap_or(0.0);
-        format!("(start {x1} {y1})")
+    // Coordinate lookup resolves to the wire's uuid first, then reuses the
+    // uuid path. Searching the raw text for `(start X Y)` could never match:
+    // eeschema writes wires as `(pts (xy X Y) (xy X Y))`, so `(start …)` does
+    // not appear in a wire at all — which is why passing coordinates always
+    // reported "Wire not found" while the same wire deleted fine by uuid.
+    let uuid = match opt_str(args, "uuid") {
+        Some(u) => u.to_string(),
+        None => {
+            let (x1, y1) = (opt_f64(args, "x1"), opt_f64(args, "y1"));
+            let (x2, y2) = (opt_f64(args, "x2"), opt_f64(args, "y2"));
+            let (Some(x1), Some(y1)) = (x1, y1) else {
+                return Ok(CallToolResult::error(
+                    "Give either uuid, or x1/y1 (and optionally x2/y2), to identify the wire.",
+                ));
+            };
+
+            let tree = konnect_sexp::parse_sexp(&content)?;
+            let wires = extract_wires(&tree);
+            // Endpoints are compared with a tolerance and in either order —
+            // a wire has no inherent direction.
+            let hit = wires.iter().find(|w| {
+                let ends_match = |ax, ay, bx, by| same_point(ax, bx) && same_point(ay, by);
+                let start_ok = ends_match(w.x1, w.y1, x1, y1) || ends_match(w.x2, w.y2, x1, y1);
+                if !start_ok {
+                    return false;
+                }
+                match (x2, y2) {
+                    (Some(x2), Some(y2)) => {
+                        ends_match(w.x1, w.y1, x2, y2) || ends_match(w.x2, w.y2, x2, y2)
+                    }
+                    _ => true,
+                }
+            });
+
+            match hit.and_then(|w| w.uuid.clone()) {
+                Some(u) => u,
+                None if hit.is_some() => {
+                    return Ok(CallToolResult::error(
+                        "Found a wire at those coordinates but it has no uuid; \
+                         re-save the schematic in KiCAD and retry.",
+                    ))
+                }
+                None => {
+                    return Ok(CallToolResult::error(format!(
+                        "No wire with an endpoint at ({x1}, {y1}) on this sheet \
+                         ({} wires present).",
+                        wires.len()
+                    )))
+                }
+            }
+        }
     };
 
+    let search_str = format!(r#"(uuid "{uuid}")"#);
     let wire_offset = match content.find(&search_str) {
         Some(o) => o,
         None => return Ok(CallToolResult::error("Wire not found")),
@@ -1078,14 +1167,35 @@ async fn handle_add_power_symbol(
         .count();
     let pwr_ref = format!("#PWR{:03}", pwr_count + 1);
 
-    // Embed the power symbol definition in lib_symbols
-    let lib_id = format!("power:{}", power_net);
+    // A power symbol's NET is its Value, not its lib_id — so a rail with a
+    // project-specific name (+12V_PROT, VBUS_5V, …) is drawn with a generic
+    // power graphic carrying that Value. Requiring `power:<net>` to exist made
+    // every custom rail unusable, and real designs name rails freely.
+    let explicit = opt_str(args, "symbol").map(str::to_string);
+    let lib_id = match explicit {
+        Some(s) if s.contains(':') => s,
+        Some(s) => format!("power:{}", s),
+        None => {
+            let exact = format!("power:{}", power_net);
+            if cse::library::resolve_lib_symbol(&exact).is_some() {
+                exact
+            } else {
+                // Ground-like names get the ground graphic; everything else
+                // gets the generic positive-rail arrow.
+                let upper = power_net.to_uppercase();
+                let groundish = ["GND", "VSS", "AGND", "DGND", "PGND", "EARTH", "GNDA", "GNDD"]
+                    .iter()
+                    .any(|g| upper.contains(g));
+                if groundish { "power:GND".to_string() } else { "power:VCC".to_string() }
+            }
+        }
+    };
     if !cse::library::ensure_lib_symbol(&mut sch, &lib_id) {
         return Ok(crate::tools::lib_symbol_not_found_error(&lib_id));
     }
 
     // Build the Symbol struct
-    let mut sym = cse::Symbol::new(format!("power:{}", power_net), x, y);
+    let mut sym = cse::Symbol::new(&lib_id, x, y);
     sym.at.rotation = Some(rotation);
     sym.unit = 1;
     sym.in_bom = true;
@@ -1114,7 +1224,9 @@ async fn handle_add_power_symbol(
     Ok(CallToolResult::json(&json!({
         "added_power": power_net,
         "reference": pwr_ref,
-        "x": x, "y": y
+        "lib_id": lib_id,
+        "x": x, "y": y,
+        "note": "The net name comes from the symbol's Value; lib_id only selects the graphic."
     })))
 }
 

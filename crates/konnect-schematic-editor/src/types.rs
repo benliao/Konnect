@@ -86,6 +86,47 @@ impl Property {
         }
     }
 
+    /// The property text's own `(at x y [angle])`, if it carries one.
+    ///
+    /// KiCAD stores field positions in absolute board coordinates, not relative
+    /// to the symbol, so moving or rotating a symbol has to move these too.
+    pub fn position(&self) -> Option<(f64, f64)> {
+        let at = self.sub_nodes.iter().find(|n| n.tag() == Some("at"))?;
+        Some((at.get_float_at(1)?, at.get_float_at(2)?))
+    }
+
+    /// The text angle from `(at x y angle)`, if present.
+    pub fn text_angle(&self) -> Option<f64> {
+        let at = self.sub_nodes.iter().find(|n| n.tag() == Some("at"))?;
+        at.get_float_at(3)
+    }
+
+    /// Move the property text, preserving its angle.
+    pub fn set_position(&mut self, x: f64, y: f64) {
+        if let Some(SexpNode::List(children)) =
+            self.sub_nodes.iter_mut().find(|n| n.tag() == Some("at"))
+        {
+            if children.len() > 2 {
+                children[1] = SexpNode::Atom(fmt_coord(x));
+                children[2] = SexpNode::Atom(fmt_coord(y));
+            }
+        }
+    }
+
+    /// Set the text angle in `(at x y angle)`, adding it if absent.
+    pub fn set_text_angle(&mut self, angle: f64) {
+        if let Some(SexpNode::List(children)) =
+            self.sub_nodes.iter_mut().find(|n| n.tag() == Some("at"))
+        {
+            let a = SexpNode::Atom(fmt_coord(angle));
+            if children.len() > 3 {
+                children[3] = a;
+            } else if children.len() == 3 {
+                children.push(a);
+            }
+        }
+    }
+
     pub fn from_sexp(node: &SexpNode) -> Option<Self> {
         let args = node.args();
         let name = args.first()?.text()?.to_owned();
@@ -181,5 +222,15 @@ impl ChangeSet {
 impl std::fmt::Display for ChangeSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.summary())
+    }
+}
+
+/// Format a coordinate the way KiCAD does: no trailing `.0` on whole numbers.
+fn fmt_coord(v: f64) -> String {
+    let r = (v * 1e6).round() / 1e6;
+    if r.fract() == 0.0 {
+        format!("{}", r as i64)
+    } else {
+        format!("{}", r)
     }
 }
