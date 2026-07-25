@@ -279,6 +279,23 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_get_drc_violations(args, ctx).await }
         ),
+        tool!(
+            "get_unrouted_nets",
+            "List every remaining connection the board still needs — the ratsnest — grouped by \
+             net, each with both endpoints' coordinates so they can be routed directly. This is \
+             the signal to iterate on while routing: route, call this again, repeat until empty. \
+             Runs headlessly; KiCAD does not need to be open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":    { "type": "string", "description": "Path to .kicad_pcb file" },
+                    "net_name": { "type": "string", "description": "Only report this net (optional)" },
+                    "limit":    { "type": "integer", "description": "Cap the connections returned", "default": 200 }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_get_unrouted_nets(args, ctx).await }
+        ),
     ]
 }
 
@@ -620,6 +637,65 @@ async fn handle_refill_zones(
     });
     if let Some(note) = sync.note() {
         out["note"] = json!(note);
+    }
+    Ok(CallToolResult::text(serde_json::to_string_pretty(&out).unwrap()))
+}
+
+async fn handle_get_unrouted_nets(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let filter = args["net_name"].as_str();
+    let limit = args["limit"].as_u64().unwrap_or(200) as usize;
+
+    if !board.exists() {
+        return Ok(CallToolResult::error(format!(
+            "No board at '{}'.",
+            board.display()
+        )));
+    }
+
+    let mut pairs = cli::get_unconnected(&ctx.config.kicad_cli, &board).await?;
+    let total = pairs.len();
+    if let Some(net) = filter {
+        pairs.retain(|p| p.net == net);
+    }
+    let matched = pairs.len();
+    pairs.truncate(limit);
+
+    // Group by net so an agent can work one net at a time.
+    let mut by_net: std::collections::BTreeMap<String, Vec<&cli::UnconnectedPair>> =
+        std::collections::BTreeMap::new();
+    for p in &pairs {
+        by_net.entry(p.net.clone()).or_default().push(p);
+    }
+
+    let nets: Vec<serde_json::Value> = by_net
+        .iter()
+        .map(|(net, ps)| {
+            json!({
+                "net": net,
+                "missing_connections": ps.len(),
+                "connections": ps.iter().map(|p| json!({
+                    "from": p.from, "to": p.to
+                })).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+
+    let mut out = json!({
+        "board": board.to_str().unwrap_or(""),
+        "fully_routed": total == 0,
+        "unrouted_connections": total,
+        "nets": nets
+    });
+    if filter.is_some() {
+        out["filtered_to_net"] = json!(filter);
+        out["matched_connections"] = json!(matched);
+    }
+    if matched > limit {
+        out["truncated"] = json!(format!("showing {limit} of {matched}"));
     }
     Ok(CallToolResult::text(serde_json::to_string_pretty(&out).unwrap()))
 }

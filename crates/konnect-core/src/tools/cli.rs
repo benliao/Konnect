@@ -163,6 +163,118 @@ fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
 
 /// Run DRC on a PCB and return parsed violations.
 /// KiCAD 10: `pcb drc --output <path> --format json [--refill-zones] <input>`
+/// One end of a missing connection, as KiCAD's connectivity engine reports it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnconnectedEnd {
+    /// KiCAD's own wording, e.g. `Pad 2 [GND] of C15 on F.Cu`.
+    pub description: String,
+    pub x: f64,
+    pub y: f64,
+    pub uuid: String,
+    /// `pad`, `track`, `via`, `zone`, … parsed from the description.
+    pub kind: String,
+    /// Component reference for a pad end (`C15`), when the description has one.
+    pub reference: Option<String>,
+    pub pad: Option<String>,
+    pub layer: Option<String>,
+}
+
+/// A pair of copper items on the same net that are not connected to each other:
+/// one ratsnest line.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnconnectedPair {
+    pub net: String,
+    pub from: UnconnectedEnd,
+    pub to: UnconnectedEnd,
+}
+
+/// The board's ratsnest — what still needs routing — from KiCAD's own
+/// connectivity engine, headlessly.
+///
+/// This is the signal an autonomous router converges on. It was previously
+/// reachable only as a boolean buried inside `validate_for_manufacturing`
+/// ("N nets defined but no traces routed"), which cannot tell an agent *what*
+/// to route next.
+pub async fn get_unconnected(cli: &str, pcb: &Path) -> Result<Vec<UnconnectedPair>> {
+    let out_path = pcb.with_extension("ratsnest.drc.json");
+    let args = vec![
+        "pcb",
+        "drc",
+        "--output",
+        out_path.to_str().unwrap(),
+        "--format",
+        "json",
+        pcb.to_str().unwrap(),
+    ];
+    run_cli(cli, &args, LONG_TIMEOUT).await?;
+
+    let json_str = tokio::fs::read_to_string(&out_path)
+        .await
+        .context("DRC output file not found")?;
+    let raw: serde_json::Value = serde_json::from_str(&json_str)?;
+    let _ = tokio::fs::remove_file(&out_path).await;
+
+    let mut pairs = Vec::new();
+    for entry in raw
+        .get("unconnected_items")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&vec![])
+    {
+        let Some(items) = entry.get("items").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        // Each entry is a pair; anything else is not a ratsnest line.
+        let (Some(a), Some(b)) = (items.first(), items.get(1)) else {
+            continue;
+        };
+        let from = parse_unconnected_end(a);
+        let to = parse_unconnected_end(b);
+        // The net is named in both descriptions; either will do.
+        let net = net_in_brackets(&from.description)
+            .or_else(|| net_in_brackets(&to.description))
+            .unwrap_or_default();
+        pairs.push(UnconnectedPair { net, from, to });
+    }
+    Ok(pairs)
+}
+
+/// The net name from KiCAD's `… [NET] …` wording.
+fn net_in_brackets(desc: &str) -> Option<String> {
+    let start = desc.find('[')? + 1;
+    let end = desc[start..].find(']')? + start;
+    Some(desc[start..end].to_string())
+}
+
+fn parse_unconnected_end(v: &serde_json::Value) -> UnconnectedEnd {
+    let description = v["description"].as_str().unwrap_or("").to_string();
+    let words: Vec<&str> = description.split_whitespace().collect();
+
+    // "Pad 2 [GND] of C15 on F.Cu" / "Track [GND] on F.Cu, length …"
+    let kind = words.first().map(|w| w.to_lowercase()).unwrap_or_default();
+    let pad = (kind == "pad").then(|| words.get(1).map(|s| s.to_string())).flatten();
+    let reference = words
+        .iter()
+        .position(|w| *w == "of")
+        .and_then(|i| words.get(i + 1))
+        .map(|s| s.to_string());
+    let layer = words
+        .iter()
+        .position(|w| *w == "on")
+        .and_then(|i| words.get(i + 1))
+        .map(|s| s.trim_end_matches(',').to_string());
+
+    UnconnectedEnd {
+        description,
+        x: v["pos"]["x"].as_f64().unwrap_or(0.0),
+        y: v["pos"]["y"].as_f64().unwrap_or(0.0),
+        uuid: v["uuid"].as_str().unwrap_or("").to_string(),
+        kind,
+        reference,
+        pad,
+        layer,
+    }
+}
+
 /// Recompute zone fills and write them back into the board.
 ///
 /// `--refill-zones` alone computes the fill and throws it away; `--save-board`
