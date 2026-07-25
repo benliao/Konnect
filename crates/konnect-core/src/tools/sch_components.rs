@@ -7,14 +7,16 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_symbol_instance_block, get_path, opt_f64, opt_str, project_name_for, require_f64,
-    require_str, ToolContext, ToolDef,
+    find_symbol_instance_block, get_path, opt_f64, opt_str, project_name_for, rename_symbol_edits,
+    require_f64, require_str, RenameOutcome, ToolContext, ToolDef,
 };
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::snap_point,
-    schematic::{extract_lib_pins, extract_symbol_instances, pin_endpoint, read_schematic},
-    writer::{apply_edits, new_uuid, write_atomic, SexpEdit},
+    schematic::{
+        extract_lib_pins_resolved, extract_symbol_instances, pin_endpoint, read_schematic,
+    },
+    writer::{apply_edits, new_uuid, write_atomic, write_atomic_checked, SexpEdit},
 };
 use serde_json::json;
 
@@ -54,12 +56,20 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "delete_schematic_component",
-            "Remove a symbol instance from the schematic by its reference designator.",
+            "Remove a symbol instance from the schematic by its reference designator. \
+             Reports any net labels left stranded on the removed component's pins (these \
+             otherwise cause 'Label not connected' ERC errors) and prunes its lib_symbols \
+             definition when nothing else uses it.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
-                    "reference": { "type": "string", "description": "Reference designator (e.g. 'R1')" }
+                    "reference": { "type": "string", "description": "Reference designator (e.g. 'R1')" },
+                    "cleanup_connections": {
+                        "type": "boolean",
+                        "description": "Also delete net labels left stranded on the removed component's pins. Default false — they are only reported.",
+                        "default": false
+                    }
                 },
                 "required": ["schematic", "reference"]
             }),
@@ -431,18 +441,171 @@ async fn handle_delete_schematic_component(
         Err(e) => return Ok(e),
     };
 
+    let cleanup = args["cleanup_connections"].as_bool().unwrap_or(false);
+
+    // Pin coordinates of the component about to go, so labels sitting on them
+    // can be reported (or removed). batch_connect_to_net drops a net label on
+    // each pin; deleting only the symbol strands them and ERC then reports
+    // "Label not connected" for every one (S4-1).
+    let doomed_pins = pin_world_positions(&sch_path, &reference).unwrap_or_default();
+
     let mut sch = cse::Schematic::load(&sch_path)?;
 
-    match sch.symbols.remove_by_reference(&reference) {
-        Some(_) => {
-            sch.overwrite()?;
-            Ok(CallToolResult::json(&json!({ "deleted": reference })))
-        }
-        None => Ok(CallToolResult::error(format!(
+    let Some(removed) = sch.symbols.remove_by_reference(&reference) else {
+        return Ok(CallToolResult::error(format!(
             "Component '{}' not found in schematic",
             reference
-        ))),
+        )));
+    };
+
+    // A label is orphaned only if no *surviving* pin still sits on it.
+    let surviving: Vec<(f64, f64)> = sch
+        .symbols
+        .iter()
+        .filter_map(|s| s.reference())
+        .flat_map(|r| pin_world_positions(&sch_path, r).unwrap_or_default())
+        .collect();
+    let is_stranded = |x: f64, y: f64| {
+        doomed_pins
+            .iter()
+            .any(|&(px, py)| near(px, x) && near(py, y))
+            && !surviving.iter().any(|&(px, py)| near(px, x) && near(py, y))
+    };
+
+    let mut orphaned = Vec::new();
+    for l in sch.labels.iter() {
+        let (x, y) = l.position();
+        if is_stranded(x, y) {
+            orphaned.push(json!({ "net": l.text, "x": x, "y": y, "kind": "label" }));
+        }
     }
+    for l in sch.global_labels.iter() {
+        let (x, y) = l.position();
+        if is_stranded(x, y) {
+            orphaned.push(json!({ "net": l.text, "x": x, "y": y, "kind": "global_label" }));
+        }
+    }
+
+    if cleanup {
+        sch.labels.retain(|l| {
+            let (x, y) = l.position();
+            !is_stranded(x, y)
+        });
+        sch.global_labels.retain(|l| {
+            let (x, y) = l.position();
+            !is_stranded(x, y)
+        });
+    }
+
+    // Drop the lib_symbols definition if nothing references it any more —
+    // KiCAD prunes unused definitions on save, and leaving them made the
+    // section grow without bound across edits.
+    let pruned = prune_unused_lib_symbol(&mut sch, &removed.lib_id.clone());
+
+    sch.overwrite()?;
+
+    Ok(CallToolResult::json(&json!({
+        "deleted": reference,
+        "orphaned_labels": orphaned,
+        "orphaned_labels_removed": cleanup,
+        "pruned_lib_symbol": pruned,
+    })))
+}
+
+fn near(a: f64, b: f64) -> bool {
+    (a - b).abs() < 0.01
+}
+
+/// World-space pin coordinates of `reference` in the schematic at `path`.
+fn pin_world_positions(path: &std::path::Path, reference: &str) -> Option<Vec<(f64, f64)>> {
+    let (_, tree) = read_schematic(path).ok()?;
+    let instances = extract_symbol_instances(&tree);
+    let inst = instances.iter().find(|i| i.reference == reference)?;
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+    let sym = lib_syms
+        .iter()
+        .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))?;
+    let t = inst.pin_transform();
+    Some(
+        extract_lib_pins_resolved(sym, &lib_syms)
+            .iter()
+            .map(|p| pin_endpoint(p, t))
+            .collect(),
+    )
+}
+
+/// Remove `lib_id`'s definition from `lib_symbols` when no symbol instance
+/// uses it any more. Returns whether anything was removed.
+fn prune_unused_lib_symbol(sch: &mut cse::Schematic, lib_id: &str) -> bool {
+    if lib_id.is_empty() {
+        return false;
+    }
+    if sch.symbols.iter().any(|s| s.lib_id == lib_id) {
+        return false;
+    }
+    // Keep a definition that a surviving symbol still extends.
+    let mut removed = false;
+    for node in sch.raw_other.iter_mut() {
+        if node.tag() != Some("lib_symbols") {
+            continue;
+        }
+        if let cse::sexp::SexpNode::List(children) = node {
+            let before = children.len();
+            children.retain(|c| {
+                c.tag() != Some("symbol")
+                    || c.children().get(1).and_then(|n| n.text()) != Some(lib_id)
+            });
+            removed = children.len() != before;
+        }
+    }
+    removed
+}
+
+/// Rewrite the value of `(property "<field>" "<value>" …)` inside the placed
+/// symbol block whose Reference is `ref_`. Returns the reason on failure so the
+/// caller can report it instead of silently claiming success.
+///
+/// Edits the raw text rather than going through `cse::Schematic`: that model
+/// keeps only `pin` and `instances` sub-nodes verbatim and re-emits everything
+/// else from typed fields, so a load→mutate→save of an eeschema-written symbol
+/// drops nodes it does not model (`exclude_from_sim`, `lib_name`, …). Editing a
+/// user's file must not silently delete parts of it.
+fn update_symbol_field(
+    content: &str,
+    ref_: &str,
+    field: &str,
+    new_val: &str,
+) -> Result<String, String> {
+    let (sym_start, sym_end) = find_symbol_instance_block(content, ref_)
+        .ok_or_else(|| format!("symbol '{ref_}' not found in this schematic"))?;
+    let sym_block = &content[sym_start..sym_end];
+    let field_search = format!(r#"(property "{field}" ""#);
+    let field_offset = sym_block
+        .find(&field_search)
+        .map(|o| sym_start + o + field_search.len())
+        .ok_or_else(|| format!("'{ref_}' has no '{field}' property"))?;
+    // Find the closing quote of the current value
+    let val_end = content[field_offset..]
+        .find('"')
+        .map(|o| field_offset + o)
+        .ok_or_else(|| format!("'{field}' property on '{ref_}' is malformed"))?;
+    Ok(format!(
+        "{}{}{}",
+        &content[..field_offset],
+        new_val,
+        &content[val_end..]
+    ))
+}
+
+/// Rename a component in both places KiCAD 6+ stores a designator, returning
+/// the rewritten content. The edit computation lives in
+/// [`rename_symbol_edits`], shared with the batch handler.
+fn rename_symbol(content: &str, old: &str, new: &str) -> Result<(String, RenameOutcome), String> {
+    let (edits, outcome) = rename_symbol_edits(content, old, new)?;
+    Ok((apply_edits(content.to_string(), edits), outcome))
 }
 
 async fn handle_edit_schematic_component(
@@ -457,55 +620,59 @@ async fn handle_edit_schematic_component(
 
     let mut content = std::fs::read_to_string(&sch_path)?;
     let mut changed = Vec::new();
-
-    // Helper: update a property field value in-place within the symbol block
-    // for `ref_`. Returns the reason on failure so the caller can report it
-    // instead of silently claiming success.
-    let update_field =
-        |content: &str, ref_: &str, field: &str, new_val: &str| -> Result<String, String> {
-            let (sym_start, sym_end) = find_symbol_instance_block(content, ref_)
-                .ok_or_else(|| format!("symbol '{ref_}' not found in this schematic"))?;
-            let sym_block = &content[sym_start..sym_end];
-            let field_search = format!(r#"(property "{field}" ""#);
-            let field_offset = sym_block
-                .find(&field_search)
-                .map(|o| sym_start + o + field_search.len())
-                .ok_or_else(|| format!("'{ref_}' has no '{field}' property"))?;
-            // Find the closing quote of the current value
-            let val_end = content[field_offset..]
-                .find('"')
-                .map(|o| field_offset + o)
-                .ok_or_else(|| format!("'{field}' property on '{ref_}' is malformed"))?;
-            Ok(format!(
-                "{}{}{}",
-                &content[..field_offset],
-                new_val,
-                &content[val_end..]
-            ))
-        };
-
     let mut errors: Vec<String> = Vec::new();
-    let mut apply = |content: &mut String, field: &str, new_val: &str| match update_field(
-        content, &reference, field, new_val,
-    ) {
-        Ok(updated) => {
-            *content = updated;
-            changed.push(format!("{} → {}", field, new_val));
-        }
-        Err(why) => errors.push(format!("{field}: {why}")),
-    };
+    // Tracks the designator the symbol is currently findable by: after a
+    // rename, later fields must be looked up under the *new* name.
+    let mut lookup_ref = reference.clone();
+
+    macro_rules! apply {
+        ($field:expr, $new_val:expr) => {
+            match update_symbol_field(&content, &lookup_ref, $field, $new_val) {
+                Ok(updated) => {
+                    content = updated;
+                    changed.push(format!("{} → {}", $field, $new_val));
+                    true
+                }
+                Err(why) => {
+                    errors.push(format!("{}: {}", $field, why));
+                    false
+                }
+            }
+        };
+    }
 
     if let Some(new_ref) = opt_str(args, "new_reference") {
-        apply(&mut content, "Reference", new_ref);
+        match rename_symbol(&content, &reference, new_ref) {
+            Ok((updated, outcome)) => {
+                content = updated;
+                // The property now reads `new_ref`, so every later field edit
+                // must look the symbol up under the new name.
+                lookup_ref = new_ref.to_string();
+                changed.push(format!("Reference → {}", new_ref));
+                if outcome.instances > 0 {
+                    changed.push(format!(
+                        "instances reference → {} ({})",
+                        new_ref, outcome.instances
+                    ));
+                } else {
+                    errors.push(format!(
+                        "instances: '{}' has no (instances …) entry, so \
+                         'Update PCB from Schematic' will not see the new name",
+                        reference
+                    ));
+                }
+            }
+            Err(why) => errors.push(format!("Reference: {why}")),
+        }
     }
     if let Some(val) = opt_str(args, "value") {
-        apply(&mut content, "Value", val);
+        apply!("Value", val);
     }
     if let Some(fp) = opt_str(args, "footprint") {
-        apply(&mut content, "Footprint", fp);
+        apply!("Footprint", fp);
     }
     if let Some(ds) = opt_str(args, "datasheet") {
-        apply(&mut content, "Datasheet", ds);
+        apply!("Datasheet", ds);
     }
 
     // A request that changed nothing is a failure, not a success — silently
@@ -519,7 +686,10 @@ async fn handle_edit_schematic_component(
     }
 
     if !changed.is_empty() {
-        write_atomic(&sch_path, &content)?;
+        // Checked: these are raw string splices, so a mis-computed offset must
+        // fail the call rather than replace the user's file with one KiCAD
+        // cannot open.
+        write_atomic_checked(&sch_path, &content, "kicad_sch")?;
     }
 
     let mut result = json!({
@@ -783,7 +953,12 @@ async fn handle_get_schematic_pin_locations(
             reference, inst.lib_id
         )));
     };
-    let lib_pins = extract_lib_pins(sym);
+    // `_resolved` follows `(extends "Parent")`: standard KiCAD parts like
+    // Transistor_FET:2N7002 carry no pins of their own and inherit them all
+    // from the parent that `ensure_lib_symbol` embedded alongside them.
+    // Scanning only the symbol's own units returned `{"pins": []}` for every
+    // derived part (S3-2).
+    let lib_pins = extract_lib_pins_resolved(sym, &lib_syms);
     let t = inst.pin_transform();
     let pins: Vec<serde_json::Value> = lib_pins
         .iter()
@@ -850,7 +1025,8 @@ async fn handle_batch_get_pin_locations(
                 });
             };
             let t = inst.pin_transform();
-            let pins: Vec<serde_json::Value> = extract_lib_pins(sym)
+            // Resolve through `(extends …)` — see handle_get_schematic_pin_locations.
+            let pins: Vec<serde_json::Value> = extract_lib_pins_resolved(sym, &lib_syms)
                 .iter()
                 .map(|p| {
                     let (sx, sy) = pin_endpoint(p, t);
@@ -1130,6 +1306,81 @@ mod tests {
         );
     }
 
+    /// Deleting a component used to strand the net labels that
+    /// batch_connect_to_net drops on its pins, and ERC then reported
+    /// "Label not connected" for each (S4-1). The labels must at minimum be
+    /// reported, and removed on request.
+    #[tokio::test]
+    async fn delete_reports_and_can_clean_up_stranded_labels() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.kicad_sch");
+        let ctx = test_ctx();
+        let p = path.display().to_string();
+
+        handle_create_schematic(&json!({ "path": p }), &ctx)
+            .await
+            .unwrap();
+        handle_add_schematic_component(
+            &json!({ "schematic": p, "lib_id": "Device:R", "x": 100.0, "y": 80.0,
+                     "reference": "R1" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // A label sitting exactly on R1's pin 1, plus one that is unrelated.
+        let pins = pin_world_positions(&path, "R1").expect("R1 has pins");
+        let (px, py) = pins[0];
+        let mut sch = cse::Schematic::load(&path).unwrap();
+        sch.add_label("+3V3", px, py);
+        sch.add_label("ELSEWHERE", px + 50.0, py + 50.0);
+        sch.overwrite().unwrap();
+
+        let result =
+            handle_delete_schematic_component(&json!({ "schematic": p, "reference": "R1" }), &ctx)
+                .await
+                .unwrap();
+        assert!(!result.is_error);
+        let raw = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        let orphans = body["orphaned_labels"].as_array().unwrap();
+        assert_eq!(
+            orphans.len(),
+            1,
+            "expected exactly one stranded label: {body}"
+        );
+        assert_eq!(orphans[0]["net"], "+3V3");
+        // Default is non-destructive: reported, still on disk.
+        assert_eq!(body["orphaned_labels_removed"], json!(false));
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert_eq!(sch.labels.iter().count(), 2, "nothing removed by default");
+        // The definition is gone now that nothing uses it.
+        assert_eq!(body["pruned_lib_symbol"], json!(true));
+
+        // With cleanup requested, only the stranded one goes.
+        handle_add_schematic_component(
+            &json!({ "schematic": p, "lib_id": "Device:R", "x": 100.0, "y": 80.0,
+                     "reference": "R1" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        handle_delete_schematic_component(
+            &json!({ "schematic": p, "reference": "R1", "cleanup_connections": true }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let names: Vec<&str> = sch.labels.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(names, vec!["ELSEWHERE"], "only the stranded label removed");
+    }
+
     #[tokio::test]
     async fn add_component_writes_eeschema_style_instance_path() {
         let (_symdir, _env) = stub_symbol_dir();
@@ -1294,6 +1545,177 @@ mod tests {
         );
     }
 
+    /// The reference designator lives in two places; a rename must move both.
+    /// Only the property is drawn in eeschema, but "Update PCB from Schematic"
+    /// reads the instances entry — updating one and not the other is what made
+    /// PCB sync keep failing on the old designator.
+    #[tokio::test]
+    async fn rename_updates_property_and_instances_block() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        handle_add_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "lib_id": "Device:R",
+                "x": 100.0, "y": 80.0,
+                "reference": "FLG1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "FLG1",
+                "new_reference": "#FLG01"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "rename failed: {:?}", result.content);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(r##"(property "Reference" "#FLG01""##),
+            "Reference property not renamed:\n{text}"
+        );
+        assert!(
+            text.contains(r##"(reference "#FLG01")"##),
+            "instances (reference …) not renamed — PCB sync reads this one:\n{text}"
+        );
+        assert!(
+            !text.contains("\"FLG1\""),
+            "old designator still present somewhere:\n{text}"
+        );
+
+        // And the typed model agrees, i.e. the file still parses.
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert!(sch.symbols.by_reference("#FLG01").is_some());
+    }
+
+    /// eeschema/KiCAD 10 write tabs; this crate's writer writes two spaces.
+    /// Neither indentation may be assumed by the rename matchers.
+    #[tokio::test]
+    async fn rename_works_on_tab_indented_eeschema_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"11111111-2222-3333-4444-555555555555\")\n\t(lib_symbols\n\t\t(symbol \"Device:R\"\n\t\t\t(property \"Reference\" \"R\"\n\t\t\t\t(at 0 0 0)\n\t\t\t)\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 100 80 0)\n\t\t(unit 1)\n\t\t(exclude_from_sim no)\n\t\t(uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 102 78 0)\n\t\t)\n\t\t(property \"Value\" \"10k\"\n\t\t\t(at 102 82 0)\n\t\t)\n\t\t(instances\n\t\t\t(project \"tabs\"\n\t\t\t\t(path \"/11111111-2222-3333-4444-555555555555\"\n\t\t\t\t\t(reference \"R1\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n)\n",
+        )
+        .unwrap();
+        let ctx = test_ctx();
+
+        // Rename and change another field in the same call: the later field
+        // must be looked up under the *new* designator.
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "R1",
+                "new_reference": "R42",
+                "value": "22k"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "rename failed: {:?}", result.content);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#"(property "Reference" "R42""#), "{text}");
+        assert!(text.contains(r#"(reference "R42")"#), "{text}");
+        assert!(text.contains(r#"(property "Value" "22k""#), "{text}");
+        assert!(!text.contains("\"R1\""), "old designator remains:\n{text}");
+        // The lib_symbols definition's own Reference must be untouched.
+        assert!(text.contains(r#"(property "Reference" "R""#), "{text}");
+        // Raw-text editing must not drop nodes the typed model doesn't know.
+        assert!(
+            text.contains("(exclude_from_sim no)"),
+            "editing dropped an unmodelled node:\n{text}"
+        );
+    }
+
+    /// Multi-unit parts repeat the designator across one `(symbol …)` block per
+    /// unit. Renaming only the first leaves the file half-renamed.
+    #[tokio::test]
+    async fn rename_covers_every_unit_of_a_multi_unit_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.kicad_sch");
+        let unit = |n: u32, y: u32| {
+            format!("\t(symbol\n\t\t(lib_id \"Amp:LM358\")\n\t\t(at 100 {y} 0)\n\t\t(unit {n})\n\t\t(uuid \"unit-{n}\")\n\t\t(property \"Reference\" \"U1\"\n\t\t\t(at 102 78 0)\n\t\t)\n\t\t(instances\n\t\t\t(project \"multi\"\n\t\t\t\t(path \"/root-uuid\"\n\t\t\t\t\t(reference \"U1\")\n\t\t\t\t\t(unit {n})\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n")
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n\t(version 20250610)\n\t(uuid \"root-uuid\")\n{}{})\n",
+                unit(1, 80),
+                unit(2, 100)
+            ),
+        )
+        .unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "U1",
+                "new_reference": "U7"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"U1\""), "a unit was left behind:\n{text}");
+        assert_eq!(
+            text.matches(r#"(property "Reference" "U7""#).count(),
+            2,
+            "both units' properties must be renamed:\n{text}"
+        );
+        assert_eq!(
+            text.matches(r#"(reference "U7")"#).count(),
+            2,
+            "both units' instance entries must be renamed:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn renaming_an_unknown_reference_is_an_error() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let result = handle_edit_schematic_component(
+            &json!({
+                "schematic": path.display().to_string(),
+                "reference": "R99",
+                "new_reference": "R1"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
     #[tokio::test]
     async fn pin_locations_error_when_definition_not_embedded() {
         let dir = tempfile::tempdir().unwrap();
@@ -1323,5 +1745,131 @@ mod tests {
         let msg = format!("{:?}", result.content);
         assert!(msg.contains("Device:CP"));
         assert!(msg.contains("no embedded definition"));
+    }
+
+    /// S3-2: a real KiCAD 10.0.4 session got `{"pins": []}` for
+    /// `Transistor_FET:2N7002` and `Regulator_Linear:XC6206PxxxMR` while
+    /// R/C/Y/D/L in the same batch call came back fine. Both are *derived*
+    /// symbols — `(extends "Parent")` with no pins of their own — and
+    /// `ensure_lib_symbol` embeds the parent alongside them, so the pins are
+    /// right there to be resolved. TAB-indented, as KiCAD 10 writes.
+    fn derived_symbol_schematic() -> String {
+        "(kicad_sch\n\
+\t(version 20250610)\n\
+\t(generator \"eeschema\")\n\
+\t(uuid \"11111111-2222-3333-4444-555555555555\")\n\
+\t(lib_symbols\n\
+\t\t(symbol \"Transistor_FET:Q_NMOS_GSD\"\n\
+\t\t\t(property \"Description\" \"scheme (pin number consists of\"\n\
+\t\t\t\t(at 0 0 0)\n\
+\t\t\t)\n\
+\t\t\t(symbol \"Q_NMOS_GSD_1_1\"\n\
+\t\t\t\t(pin input line\n\
+\t\t\t\t\t(at -5.08 -2.54 0)\n\
+\t\t\t\t\t(length 2.54)\n\
+\t\t\t\t\t(name \"G\")\n\
+\t\t\t\t\t(number \"1\")\n\
+\t\t\t\t)\n\
+\t\t\t\t(pin passive line\n\
+\t\t\t\t\t(at 0 -5.08 90)\n\
+\t\t\t\t\t(length 2.54)\n\
+\t\t\t\t\t(name \"S\")\n\
+\t\t\t\t\t(number \"2\")\n\
+\t\t\t\t)\n\
+\t\t\t\t(pin passive line\n\
+\t\t\t\t\t(at 0 5.08 270)\n\
+\t\t\t\t\t(length 2.54)\n\
+\t\t\t\t\t(name \"D\")\n\
+\t\t\t\t\t(number \"3\")\n\
+\t\t\t\t)\n\
+\t\t\t)\n\
+\t\t\t(embedded_fonts no)\n\
+\t\t)\n\
+\t\t(symbol \"Transistor_FET:2N7002\"\n\
+\t\t\t(extends \"Transistor_FET:Q_NMOS_GSD\")\n\
+\t\t\t(property \"Reference\" \"Q\"\n\
+\t\t\t\t(at 5.08 1.905 0)\n\
+\t\t\t)\n\
+\t\t\t(embedded_fonts no)\n\
+\t\t)\n\
+\t)\n\
+\t(symbol\n\
+\t\t(lib_id \"Transistor_FET:2N7002\")\n\
+\t\t(at 100 80 0)\n\
+\t\t(unit 1)\n\
+\t\t(uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n\
+\t\t(property \"Reference\" \"Q1\"\n\
+\t\t\t(at 105 78 0)\n\
+\t\t)\n\
+\t\t(property \"Value\" \"2N7002\"\n\
+\t\t\t(at 105 80 0)\n\
+\t\t)\n\
+\t)\n\
+)\n"
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn pin_locations_resolve_through_extends_for_derived_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("derived.kicad_sch");
+        std::fs::write(&path, derived_symbol_schematic()).unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_get_schematic_pin_locations(
+            &json!({ "schematic": path.display().to_string(), "reference": "Q1" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let v = result_json(&result);
+        let pins = v["pins"].as_array().unwrap();
+        assert_eq!(pins.len(), 3, "derived 2N7002 must inherit 3 pins, got {v}");
+
+        // Drain pin (3) sits at local (0, +5.08) in Y-up symbol space, which is
+        // 5.08 mm ABOVE the component in Y-down schematic space.
+        let d = pins.iter().find(|p| p["number"] == "3").unwrap();
+        assert_eq!(d["name"], "D");
+        assert!((d["x"].as_f64().unwrap() - 100.0).abs() < 1e-9);
+        assert!((d["y"].as_f64().unwrap() - 74.92).abs() < 1e-9, "got {d}");
+    }
+
+    #[tokio::test]
+    async fn batch_pin_locations_resolve_through_extends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("derived_batch.kicad_sch");
+        std::fs::write(&path, derived_symbol_schematic()).unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_batch_get_pin_locations(
+            &json!({ "schematic": path.display().to_string(), "references": ["Q1"] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let v = result_json(&result);
+        let comp = &v["components"][0];
+        assert_eq!(
+            comp["pins"].as_array().unwrap().len(),
+            3,
+            "S3-2: batch call returned an empty pin list for a derived symbol: {v}"
+        );
+    }
+
+    /// The JSON payload of a CallToolResult, for tests that inspect it.
+    fn result_json(result: &CallToolResult) -> serde_json::Value {
+        let text = result
+            .content
+            .iter()
+            .find_map(|c| match c {
+                crate::mcp::protocol::ToolContent::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("a text content block");
+        serde_json::from_str(&text).expect("payload must be JSON")
     }
 }

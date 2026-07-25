@@ -1,7 +1,6 @@
 ---
 name: kicad-schematic-build-agent
 description: "Builds complete circuits from requirements or reference designs. Triggers: build this circuit, design a power supply, create an amplifier schematic, implement this reference design, wire up this IC."
-model: claude-sonnet-4-20250514
 tools:
   - mcp__konnect__*
 maxTurns: 40

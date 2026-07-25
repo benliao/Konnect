@@ -271,6 +271,90 @@ pub fn extract_lib_pins(sym_node: &SexpNode) -> Vec<LibPin> {
     out
 }
 
+/// Longest `(extends …)` chain we will follow. KiCAD's own libraries never go
+/// deeper than a couple of hops; the bound exists purely so a hand-edited or
+/// corrupt file cannot spin us forever.
+const MAX_EXTENDS_DEPTH: usize = 16;
+
+/// The `Library:Name` of a `lib_symbols` entry, i.e. `(symbol "Device:R" …)`.
+fn lib_symbol_name(sym_node: &SexpNode) -> Option<&str> {
+    sym_node.get(1)?.as_str()
+}
+
+/// Everything after the last `:` — `"Transistor_FET:Q_NMOS_GSD"` → `"Q_NMOS_GSD"`.
+fn bare_symbol_name(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
+}
+
+/// Look up a `lib_symbols` entry by name.
+///
+/// `ensure_lib_symbol` rewrites an embedded symbol's own name AND its
+/// `(extends "Parent")` argument to be library-prefixed, so an exact match is
+/// the normal path. Schematics written by eeschema (or by older konnect
+/// builds) can carry a bare, unprefixed parent name, so fall back to comparing
+/// the part after the last `:` on both sides.
+pub fn find_lib_symbol<'a>(lib_symbols: &[&'a SexpNode], name: &str) -> Option<&'a SexpNode> {
+    if let Some(exact) = lib_symbols
+        .iter()
+        .find(|n| lib_symbol_name(n) == Some(name))
+    {
+        return Some(exact);
+    }
+    let bare = bare_symbol_name(name);
+    lib_symbols
+        .iter()
+        .find(|n| lib_symbol_name(n).map(bare_symbol_name) == Some(bare))
+        .copied()
+}
+
+/// Extract a library symbol's pins, following `(extends "Parent")` when the
+/// symbol defines none of its own.
+///
+/// Most standard KiCAD parts are *derived* symbols: `Transistor_FET:2N7002` is
+/// nothing but properties plus `(extends "Q_NMOS_GSD")`, and every pin lives on
+/// the parent `Q_NMOS_GSD`. Scanning only the symbol's own unit sub-blocks
+/// therefore returns an empty pin list for them — the S3-2 bug, where
+/// `batch_get_schematic_pin_locations` reported `{"pins": []}` for
+/// `Regulator_Linear:XC6206PxxxMR` and `Transistor_FET:2N7002` while
+/// non-derived parts (R, C, Y, D, L) in the very same call came back fine.
+///
+/// `lib_symbols` is the sibling list from the schematic's `(lib_symbols …)`
+/// section; `ensure_lib_symbol` recursively embeds parents there alongside
+/// their children, so the parent is expected to be present. A missing or
+/// cyclic `extends` chain yields an empty list rather than a hang.
+pub fn extract_lib_pins_resolved(sym_node: &SexpNode, lib_symbols: &[&SexpNode]) -> Vec<LibPin> {
+    let mut current = sym_node;
+    let mut seen: Vec<&str> = lib_symbol_name(sym_node).into_iter().collect();
+
+    for _ in 0..MAX_EXTENDS_DEPTH {
+        let pins = extract_lib_pins(current);
+        if !pins.is_empty() {
+            return pins;
+        }
+        // No pins of its own: follow `extends`, if any.
+        let Some(parent_name) = current.find_str("extends") else {
+            return pins; // empty — a genuinely pinless symbol
+        };
+        let Some(parent) = find_lib_symbol(lib_symbols, parent_name) else {
+            return Vec::new(); // parent not embedded
+        };
+        // Compare against the *resolved* entry's own name as well as the
+        // `extends` argument: the bare-name fallback can land on a node whose
+        // name differs from the argument, and only the resolved name closes
+        // the loop in that case.
+        let resolved = lib_symbol_name(parent);
+        if seen.contains(&parent_name) || resolved.is_some_and(|r| seen.contains(&r)) {
+            return Vec::new(); // cycle
+        }
+        seen.push(parent_name);
+        if let Some(r) = resolved.filter(|r| *r != parent_name) {
+            seen.push(r);
+        }
+        current = parent;
+    }
+    Vec::new()
+}
+
 fn collect_pins_recursive(node: &SexpNode, out: &mut Vec<LibPin>) {
     for pin in node.find_all("pin") {
         if let Some(lib_pin) = parse_lib_pin(pin) {
@@ -395,6 +479,203 @@ pub fn format_net_label(net: &str, x: f64, y: f64, rotation: f64) -> String {
     (uuid "{uuid}")
   )"#
     )
+}
+
+#[cfg(test)]
+mod derived_symbol_pin_tests {
+    use super::*;
+    use crate::parser::parse_sexp;
+
+    /// A TAB-indented lib_symbols section, exactly as KiCAD 10 writes it, with
+    /// a parent that owns the pins and a derived child that owns none.
+    /// Mirrors the real `Transistor_FET:2N7002` → `Q_NMOS_GSD` shape that
+    /// produced `{"pins": []}` in the S3-2 report.
+    ///
+    /// The parent's pin *names* deliberately carry unbalanced parens
+    /// (`PA13(JTMS`) — real KiCAD libraries contain those, and any paren
+    /// counting that doesn't skip quoted strings desynchronises on them.
+    const TAB_FIXTURE: &str = "(kicad_sch\n\
+\t(lib_symbols\n\
+\t\t(symbol \"Transistor_FET:Q_NMOS_GSD\"\n\
+\t\t\t(pin_numbers\n\
+\t\t\t\t(hide yes)\n\
+\t\t\t)\n\
+\t\t\t(property \"Description\" \"scheme (pin number consists of\"\n\
+\t\t\t\t(at 0 0 0)\n\
+\t\t\t)\n\
+\t\t\t(symbol \"Q_NMOS_GSD_0_1\"\n\
+\t\t\t\t(circle\n\
+\t\t\t\t\t(center 0.75 0)\n\
+\t\t\t\t\t(radius 2.8)\n\
+\t\t\t\t)\n\
+\t\t\t)\n\
+\t\t\t(symbol \"Q_NMOS_GSD_1_1\"\n\
+\t\t\t\t(pin input line\n\
+\t\t\t\t\t(at -5.08 -2.54 0)\n\
+\t\t\t\t\t(length 2.54)\n\
+\t\t\t\t\t(name \"PA13(JTMS\"\n\
+\t\t\t\t\t\t(effects\n\
+\t\t\t\t\t\t\t(font\n\
+\t\t\t\t\t\t\t\t(size 1.27 1.27)\n\
+\t\t\t\t\t\t\t)\n\
+\t\t\t\t\t\t)\n\
+\t\t\t\t\t)\n\
+\t\t\t\t\t(number \"1\"\n\
+\t\t\t\t\t\t(effects\n\
+\t\t\t\t\t\t\t(font\n\
+\t\t\t\t\t\t\t\t(size 1.27 1.27)\n\
+\t\t\t\t\t\t\t)\n\
+\t\t\t\t\t\t)\n\
+\t\t\t\t\t)\n\
+\t\t\t\t)\n\
+\t\t\t\t(pin passive line\n\
+\t\t\t\t\t(at 0 -5.08 90)\n\
+\t\t\t\t\t(length 2.54)\n\
+\t\t\t\t\t(name \"S\"\n\
+\t\t\t\t\t\t(effects\n\
+\t\t\t\t\t\t\t(font\n\
+\t\t\t\t\t\t\t\t(size 1.27 1.27)\n\
+\t\t\t\t\t\t\t)\n\
+\t\t\t\t\t\t)\n\
+\t\t\t\t\t)\n\
+\t\t\t\t\t(number \"2\"\n\
+\t\t\t\t\t\t(effects\n\
+\t\t\t\t\t\t\t(font\n\
+\t\t\t\t\t\t\t\t(size 1.27 1.27)\n\
+\t\t\t\t\t\t\t)\n\
+\t\t\t\t\t\t)\n\
+\t\t\t\t\t)\n\
+\t\t\t\t)\n\
+\t\t\t\t(pin passive line\n\
+\t\t\t\t\t(at 0 5.08 270)\n\
+\t\t\t\t\t(length 2.54)\n\
+\t\t\t\t\t(name \"D\"\n\
+\t\t\t\t\t\t(effects\n\
+\t\t\t\t\t\t\t(font\n\
+\t\t\t\t\t\t\t\t(size 1.27 1.27)\n\
+\t\t\t\t\t\t\t)\n\
+\t\t\t\t\t\t)\n\
+\t\t\t\t\t)\n\
+\t\t\t\t\t(number \"3\"\n\
+\t\t\t\t\t\t(effects\n\
+\t\t\t\t\t\t\t(font\n\
+\t\t\t\t\t\t\t\t(size 1.27 1.27)\n\
+\t\t\t\t\t\t\t)\n\
+\t\t\t\t\t\t)\n\
+\t\t\t\t\t)\n\
+\t\t\t\t)\n\
+\t\t\t)\n\
+\t\t\t(embedded_fonts no)\n\
+\t\t)\n\
+\t\t(symbol \"Transistor_FET:2N7002\"\n\
+\t\t\t(extends \"Transistor_FET:Q_NMOS_GSD\")\n\
+\t\t\t(property \"Reference\" \"Q\"\n\
+\t\t\t\t(at 5.08 1.905 0)\n\
+\t\t\t)\n\
+\t\t\t(property \"Value\" \"2N7002\"\n\
+\t\t\t\t(at 5.08 0 0)\n\
+\t\t\t)\n\
+\t\t\t(embedded_fonts no)\n\
+\t\t)\n\
+\t)\n\
+)\n";
+
+    fn lib_symbols_of(src: &str) -> SexpNode {
+        parse_sexp(src).expect("fixture must parse")
+    }
+
+    #[test]
+    fn derived_symbol_resolves_pins_from_its_embedded_parent() {
+        let tree = lib_symbols_of(TAB_FIXTURE);
+        let lib_syms = tree.find("lib_symbols").unwrap().find_all("symbol");
+        let child = find_lib_symbol(&lib_syms, "Transistor_FET:2N7002").expect("child present");
+
+        // The pre-fix behaviour, kept as the contrast this test exists for.
+        assert!(
+            extract_lib_pins(child).is_empty(),
+            "the derived symbol genuinely has no pins of its own"
+        );
+
+        let pins = extract_lib_pins_resolved(child, &lib_syms);
+        let mut numbers: Vec<&str> = pins.iter().map(|p| p.number.as_str()).collect();
+        numbers.sort_unstable();
+        assert_eq!(
+            numbers,
+            vec!["1", "2", "3"],
+            "2N7002 must inherit G/S/D from Q_NMOS_GSD, got {pins:?}"
+        );
+
+        // Geometry must come through intact, not just the count.
+        let d = pins.iter().find(|p| p.number == "3").unwrap();
+        assert_eq!(d.name, "D");
+        assert!((d.local_y - 5.08).abs() < 1e-9);
+        assert!((d.rotation - 270.0).abs() < 1e-9);
+
+        // The unbalanced-paren pin name must survive verbatim.
+        let g = pins.iter().find(|p| p.number == "1").unwrap();
+        assert_eq!(g.name, "PA13(JTMS");
+    }
+
+    #[test]
+    fn non_derived_symbol_is_unaffected() {
+        let tree = lib_symbols_of(TAB_FIXTURE);
+        let lib_syms = tree.find("lib_symbols").unwrap().find_all("symbol");
+        let parent = find_lib_symbol(&lib_syms, "Transistor_FET:Q_NMOS_GSD").unwrap();
+        assert_eq!(extract_lib_pins_resolved(parent, &lib_syms).len(), 3);
+    }
+
+    #[test]
+    fn bare_parent_name_still_resolves() {
+        // eeschema (and older konnect builds) can leave the `extends` argument
+        // unprefixed while the embedded parent carries the `Library:` prefix.
+        let src = TAB_FIXTURE.replace(
+            "(extends \"Transistor_FET:Q_NMOS_GSD\")",
+            "(extends \"Q_NMOS_GSD\")",
+        );
+        let tree = lib_symbols_of(&src);
+        let lib_syms = tree.find("lib_symbols").unwrap().find_all("symbol");
+        let child = find_lib_symbol(&lib_syms, "Transistor_FET:2N7002").unwrap();
+        assert_eq!(extract_lib_pins_resolved(child, &lib_syms).len(), 3);
+    }
+
+    #[test]
+    fn missing_parent_yields_empty_not_a_panic() {
+        let src = TAB_FIXTURE.replace(
+            "(extends \"Transistor_FET:Q_NMOS_GSD\")",
+            "(extends \"Transistor_FET:Nonexistent_Parent\")",
+        );
+        let tree = lib_symbols_of(&src);
+        let lib_syms = tree.find("lib_symbols").unwrap().find_all("symbol");
+        let child = find_lib_symbol(&lib_syms, "Transistor_FET:2N7002").unwrap();
+        assert!(extract_lib_pins_resolved(child, &lib_syms).is_empty());
+    }
+
+    #[test]
+    fn cyclic_extends_terminates() {
+        let src = "(kicad_sch\n\
+\t(lib_symbols\n\
+\t\t(symbol \"L:A\"\n\
+\t\t\t(extends \"L:B\")\n\
+\t\t)\n\
+\t\t(symbol \"L:B\"\n\
+\t\t\t(extends \"L:A\")\n\
+\t\t)\n\
+\t)\n\
+)\n";
+        let tree = lib_symbols_of(src);
+        let lib_syms = tree.find("lib_symbols").unwrap().find_all("symbol");
+        let a = find_lib_symbol(&lib_syms, "L:A").unwrap();
+        assert!(extract_lib_pins_resolved(a, &lib_syms).is_empty());
+    }
+
+    #[test]
+    fn self_extends_terminates() {
+        let src = "(kicad_sch\n\t(lib_symbols\n\t\t(symbol \"L:A\"\n\t\t\t(extends \"L:A\")\n\t\t)\n\t)\n)\n";
+        let tree = lib_symbols_of(src);
+        let lib_syms = tree.find("lib_symbols").unwrap().find_all("symbol");
+        let a = find_lib_symbol(&lib_syms, "L:A").unwrap();
+        assert!(extract_lib_pins_resolved(a, &lib_syms).is_empty());
+    }
 }
 
 #[cfg(test)]

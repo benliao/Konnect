@@ -421,8 +421,11 @@ async fn handle_get_pin_connections(
     let lib_sym = lib_syms
         .iter()
         .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
+    // `_resolved` follows `(extends "Parent")`: a derived symbol such as
+    // Transistor_FET:2N7002 has no pins of its own and inherits them from the
+    // parent embedded alongside it in this same `lib_symbols` section.
     let pin_ep = lib_sym.and_then(|sym| {
-        konnect_sexp::schematic::extract_lib_pins(sym)
+        konnect_sexp::schematic::extract_lib_pins_resolved(sym, &lib_syms)
             .iter()
             .find(|p| p.number == pin_number)
             .map(|p| konnect_sexp::schematic::pin_endpoint(p, inst.pin_transform()))
@@ -469,7 +472,7 @@ async fn handle_get_component_nets(
     let mut g = build_net_graph(&wires, &labels);
     let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
         let t = inst.pin_transform();
-        konnect_sexp::schematic::extract_lib_pins(sym).iter().map(|p| {
+        konnect_sexp::schematic::extract_lib_pins_resolved(sym, &lib_syms).iter().map(|p| {
             let (px, py) = konnect_sexp::schematic::pin_endpoint(p, t);
             json!({ "pin": p.number, "name": p.name, "x": px, "y": py, "net": g.net_at(px, py) })
         }).collect()
@@ -507,17 +510,18 @@ async fn handle_get_net_components(
                 .iter()
                 .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))?;
             let t = inst.pin_transform();
-            let connected: Vec<_> = konnect_sexp::schematic::extract_lib_pins(ls)
-                .iter()
-                .filter_map(|p| {
-                    let (px, py) = konnect_sexp::schematic::pin_endpoint(p, t);
-                    if net_pts.contains(&pt_key(px, py)) {
-                        Some(json!({ "pin": p.number, "name": p.name }))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let connected: Vec<_> =
+                konnect_sexp::schematic::extract_lib_pins_resolved(ls, &lib_syms)
+                    .iter()
+                    .filter_map(|p| {
+                        let (px, py) = konnect_sexp::schematic::pin_endpoint(p, t);
+                        if net_pts.contains(&pt_key(px, py)) {
+                            Some(json!({ "pin": p.number, "name": p.name }))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
             if connected.is_empty() {
                 None
             } else {
@@ -690,7 +694,7 @@ async fn handle_get_connected_items(
     let mut connected_nets: HashSet<String> = HashSet::new();
     if let Some(sym) = lib_sym {
         let t = inst.pin_transform();
-        for p in konnect_sexp::schematic::extract_lib_pins(sym) {
+        for p in konnect_sexp::schematic::extract_lib_pins_resolved(sym, &lib_syms) {
             let (px, py) = konnect_sexp::schematic::pin_endpoint(&p, t);
             if let Some(net) = g.net_at(px, py) {
                 connected_nets.insert(net);
@@ -726,7 +730,7 @@ async fn handle_get_connected_items(
         .filter_map(|i| {
             let ls = lib_syms.iter().find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&i.lib_id))?;
             let t = i.pin_transform();
-            let matching_pins: Vec<_> = konnect_sexp::schematic::extract_lib_pins(ls).iter()
+            let matching_pins: Vec<_> = konnect_sexp::schematic::extract_lib_pins_resolved(ls, &lib_syms).iter()
                 .filter_map(|p| {
                     let (px, py) = konnect_sexp::schematic::pin_endpoint(p, t);
                     if all_net_pts.contains(&pt_key(px, py)) {
@@ -816,4 +820,168 @@ async fn handle_check_overlaps(
     Ok(CallToolResult::json(
         &json!({ "overlap_count": all.len(), "overlaps": all }),
     ))
+}
+
+#[cfg(test)]
+mod derived_symbol_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// TAB-indented exactly the way KiCAD 10 writes files — this codebase's own
+    /// writer uses two spaces, and every analysis path has to cope with both.
+    ///
+    /// `Transistor_FET:2N7002` is a real derived symbol: it owns no pins at all
+    /// and inherits G/S/D from the sibling `Q_NMOS_GSD` entry. Q1 sits at
+    /// (100, 100) unrotated, so with local Y-up → screen Y-down the pins land at
+    /// G (94.92, 100), S (100, 105.08), D (100, 94.92); a label sits on the gate.
+    const DERIVED_SCH: &str = "(kicad_sch\n\
+\t(version 20250114)\n\
+\t(generator \"eeschema\")\n\
+\t(uuid \"0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\")\n\
+\t(paper \"A4\")\n\
+\t(lib_symbols\n\
+\t\t(symbol \"Transistor_FET:Q_NMOS_GSD\"\n\
+\t\t\t(pin_numbers hide)\n\
+\t\t\t(symbol \"Q_NMOS_GSD_0_1\"\n\
+\t\t\t\t(pin passive line\n\
+\t\t\t\t\t(at -5.08 0 0)\n\
+\t\t\t\t\t(length 2.54)\n\
+\t\t\t\t\t(name \"G\")\n\
+\t\t\t\t\t(number \"1\")\n\
+\t\t\t\t)\n\
+\t\t\t\t(pin passive line\n\
+\t\t\t\t\t(at 0 -5.08 90)\n\
+\t\t\t\t\t(length 2.54)\n\
+\t\t\t\t\t(name \"S\")\n\
+\t\t\t\t\t(number \"2\")\n\
+\t\t\t\t)\n\
+\t\t\t\t(pin passive line\n\
+\t\t\t\t\t(at 0 5.08 270)\n\
+\t\t\t\t\t(length 2.54)\n\
+\t\t\t\t\t(name \"D\")\n\
+\t\t\t\t\t(number \"3\")\n\
+\t\t\t\t)\n\
+\t\t\t)\n\
+\t\t)\n\
+\t\t(symbol \"Transistor_FET:2N7002\"\n\
+\t\t\t(extends \"Transistor_FET:Q_NMOS_GSD\")\n\
+\t\t\t(property \"Reference\" \"Q\"\n\
+\t\t\t\t(at 5.08 1.905 0)\n\
+\t\t\t)\n\
+\t\t\t(property \"Value\" \"2N7002\"\n\
+\t\t\t\t(at 5.08 0 0)\n\
+\t\t\t)\n\
+\t\t)\n\
+\t)\n\
+\t(symbol\n\
+\t\t(lib_id \"Transistor_FET:2N7002\")\n\
+\t\t(at 100 100 0)\n\
+\t\t(unit 1)\n\
+\t\t(uuid \"11111111-2222-3333-4444-555555555555\")\n\
+\t\t(property \"Reference\" \"Q1\"\n\
+\t\t\t(at 105.08 98 0)\n\
+\t\t)\n\
+\t\t(property \"Value\" \"2N7002\"\n\
+\t\t\t(at 105.08 100 0)\n\
+\t\t)\n\
+\t)\n\
+\t(label \"GATE_DRIVE\"\n\
+\t\t(at 94.92 100 0)\n\
+\t\t(uuid \"66666666-7777-8888-9999-aaaaaaaaaaaa\")\n\
+\t)\n\
+)\n";
+
+    fn write_sch() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("derived.kicad_sch");
+        std::fs::write(&path, DERIVED_SCH).unwrap();
+        (dir, path)
+    }
+
+    fn json_of(result: &CallToolResult) -> serde_json::Value {
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected a text result");
+        };
+        serde_json::from_str(text).expect("tool result must be JSON")
+    }
+
+    #[tokio::test]
+    async fn derived_symbol_contributes_pins_to_component_nets() {
+        // Baseline: the derived entry really does own zero pins, so this test
+        // starts failing the moment anything reverts to the unresolved extractor.
+        let tree = konnect_sexp::parser::parse_sexp(DERIVED_SCH).unwrap();
+        let lib_syms = tree
+            .find("lib_symbols")
+            .map(|n| n.find_all("symbol"))
+            .unwrap_or_default();
+        let child = lib_syms
+            .iter()
+            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some("Transistor_FET:2N7002"))
+            .expect("derived symbol present");
+        assert!(
+            konnect_sexp::schematic::extract_lib_pins(child).is_empty(),
+            "fixture must model a genuinely pinless derived symbol"
+        );
+
+        let (_d, path) = write_sch();
+        let result = handle_get_component_nets(
+            &json!({ "schematic": path.display().to_string(), "reference": "Q1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let v = json_of(&result);
+        let pins = v["pins"].as_array().expect("pins array");
+        let mut names: Vec<&str> = pins.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["D", "G", "S"],
+            "Q1 must inherit all three pins from Q_NMOS_GSD, got {v}"
+        );
+
+        // The inherited geometry has to be real, not just a count: the label on
+        // the gate only resolves through a correctly transformed pin position.
+        let gate = pins.iter().find(|p| p["name"] == "G").unwrap();
+        assert_eq!(gate["net"], json!("GATE_DRIVE"), "gate pin: {gate}");
+    }
+
+    #[tokio::test]
+    async fn derived_symbol_pins_are_visible_to_net_component_lookup() {
+        let (_d, path) = write_sch();
+        let result = handle_get_net_components(
+            &json!({ "schematic": path.display().to_string(), "net": "GATE_DRIVE" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let v = json_of(&result);
+        let comps = v["components"].as_array().expect("components array");
+        assert_eq!(
+            comps.len(),
+            1,
+            "the derived FET must show up on GATE_DRIVE: {v}"
+        );
+        assert_eq!(comps[0]["reference"], json!("Q1"));
+        assert_eq!(comps[0]["pins"][0]["name"], json!("G"));
+    }
 }

@@ -1039,6 +1039,52 @@ async fn handle_list_symbol_libraries(
     ))
 }
 
+/// Expand `${VAR}` references in a library-table URI.
+///
+/// KiCAD writes every stock entry as `${KICAD10_SYMBOL_DIR}/Device.kicad_sym`,
+/// so code that skips `${`-prefixed URIs sees an empty library table. Falls back
+/// to the installed symbol directories for the well-known KiCAD path variables
+/// when the environment does not define them (KiCAD sets them internally, not
+/// in the shell the MCP server inherits).
+fn expand_kicad_vars(path: &Path) -> PathBuf {
+    let raw = match path.to_str() {
+        Some(s) if s.contains("${") => s,
+        _ => return path.to_path_buf(),
+    };
+
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(open) = rest.find("${") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let Some(close) = after.find('}') else {
+            out.push_str(&rest[open..]);
+            return PathBuf::from(out);
+        };
+        let var = &after[..close];
+        let value = std::env::var(var).ok().or_else(|| {
+            // KiCAD's own symbol/footprint dir variables, resolved from the
+            // install locations this server already probes.
+            (var.contains("SYMBOL_DIR") || var.contains("FOOTPRINT_DIR"))
+                .then(|| {
+                    konnect_schematic_editor::library::find_symbol_dirs()
+                        .first()
+                        .map(|p| p.display().to_string())
+                })
+                .flatten()
+        });
+        match value {
+            Some(v) => out.push_str(&v),
+            // Unresolvable — keep the literal so the caller's `exists()` fails
+            // rather than silently pointing somewhere wrong.
+            None => out.push_str(&rest[open..open + 2 + close + 1]),
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    PathBuf::from(out)
+}
+
 /// Insert a new `(lib ...)` entry into a lib-table file (fp-lib-table or sym-lib-table).
 /// Creates the file with minimal scaffolding if it doesn't exist.
 async fn register_in_lib_table(
@@ -1047,10 +1093,16 @@ async fn register_in_lib_table(
     uri: &str,
     lib_type: &str,
 ) -> anyhow::Result<()> {
+    // The root tag differs per table — a sym-lib-table with an `fp_lib_table`
+    // root is rejected by KiCAD, killing project-level symbol resolution.
+    let root_tag = match table_path.file_name().and_then(|n| n.to_str()) {
+        Some(n) if n.starts_with("sym") => "sym_lib_table",
+        _ => "fp_lib_table",
+    };
     let content = if table_path.exists() {
         tokio::fs::read_to_string(table_path).await?
     } else {
-        "(fp_lib_table\n  (version 7)\n)\n".to_string()
+        format!("({root_tag}\n  (version 7)\n)\n")
     };
 
     // Check if nickname already registered
@@ -1322,6 +1374,78 @@ async fn handle_create_symbol(
     ))
 }
 
+/// Remove exactly one top-level `(symbol "NAME" …)` block from `.kicad_sym`
+/// content, including its leading indentation.
+///
+/// Structural rather than textual. The previous implementation searched for the
+/// literal `format!("  (symbol \"{}\"", name)` — a hardcoded two-space indent —
+/// which never matches a KiCAD-written library (KiCAD indents with tabs), so
+/// deleting a symbol from a real library always failed and custom-symbol
+/// correction was impossible.
+///
+/// Every offset is derived and then re-verified. A delete that cannot locate
+/// its block returns an error rather than falling back to offset 0; that
+/// fallback has already erased an entire file once in this codebase.
+fn delete_symbol_from_content(content: &str, symbol_name: &str) -> anyhow::Result<String> {
+    let block = konnect_schematic_editor::library::extract_symbol_block(content, symbol_name)
+        .ok_or_else(|| anyhow::anyhow!("Symbol '{}' not found in library", symbol_name))?;
+
+    // `block` was sliced out of `content`, so it must be findable again.
+    let start = content.find(block.as_str()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "internal error: symbol block for '{}' could not be relocated",
+            symbol_name
+        )
+    })?;
+
+    let (cut_start, cut_end) =
+        konnect_sexp::writer::find_block_with_leading_whitespace(content, start)
+            .ok_or_else(|| anyhow::anyhow!("Symbol '{}' has an unbalanced block", symbol_name))?;
+
+    // The computed range must be this symbol's block and nothing more.
+    if cut_end != start + block.len()
+        || !content[cut_start..cut_end]
+            .trim_start()
+            .starts_with("(symbol")
+    {
+        anyhow::bail!(
+            "refusing to delete '{}': computed range does not line up with its block",
+            symbol_name
+        );
+    }
+
+    let mut new_content = String::with_capacity(content.len() - (cut_end - cut_start));
+    new_content.push_str(&content[..cut_start]);
+    new_content.push_str(&content[cut_end..]);
+
+    // Validate the candidate before the caller commits it to disk.
+    konnect_sexp::writer::check_document(&new_content, "kicad_symbol_lib").map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to delete '{}': result is not a valid symbol library ({})",
+            symbol_name,
+            e
+        )
+    })?;
+
+    // …and confirm the edit removed this symbol and left every other one alone.
+    let mut expected = konnect_schematic_editor::library::top_level_symbol_names(content);
+    if let Some(idx) = expected.iter().position(|n| n == symbol_name) {
+        expected.remove(idx);
+    }
+    let actual = konnect_schematic_editor::library::top_level_symbol_names(&new_content);
+    if actual != expected {
+        anyhow::bail!(
+            "refusing to delete '{}': edit would have changed other symbols \
+             (expected {} remaining, got {})",
+            symbol_name,
+            expected.len(),
+            actual.len()
+        );
+    }
+
+    Ok(new_content)
+}
+
 async fn handle_delete_symbol(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1330,40 +1454,7 @@ async fn handle_delete_symbol(
     let symbol_name = require_str(args, "symbol_name").map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
     let content = tokio::fs::read_to_string(&lib_path).await?;
-
-    // Find `  (symbol "NAME"` block
-    let pat = format!(r#"  (symbol "{}""#, symbol_name);
-    let start = content
-        .find(&pat)
-        .ok_or_else(|| anyhow::anyhow!("Symbol '{}' not found in library", symbol_name))?;
-
-    // Walk back to find preceding newline
-    let block_start = content[..start].rfind('\n').map(|i| i + 1).unwrap_or(start);
-
-    // Walk forward to find end of block (depth count)
-    let mut depth = 0i32;
-    let mut end = start;
-    for (i, ch) in content[start..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = start + i + 1;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    // Skip trailing newline
-    let end = if content[end..].starts_with('\n') {
-        end + 1
-    } else {
-        end
-    };
-
-    let new_content = format!("{}{}", &content[..block_start], &content[end..]);
+    let new_content = delete_symbol_from_content(&content, symbol_name)?;
     write_atomic(&lib_path, &new_content)?;
 
     Ok(CallToolResult::text(
@@ -1407,18 +1498,31 @@ fn top_level_symbol_names(content: &str) -> anyhow::Result<Vec<String>> {
 /// entry whose nickname matches and whose `uri` does not use an unresolved KiCad
 /// env var (`${…}`). Both tables are read with `parse_lib_table`.
 async fn resolve_symbol_lib_path(nick: &str, project_dir: Option<&Path>) -> Option<PathBuf> {
-    let mut tables = vec![global_sym_lib_table()];
+    // Project scope first: KiCAD resolves a nickname against the project's
+    // table before the global one, so a project-local library of the same name
+    // must win.
+    let mut tables = Vec::new();
     if let Some(pd) = project_dir {
         tables.push(pd.join("sym-lib-table"));
     }
+    tables.push(global_sym_lib_table());
+
     for table in tables {
         let Ok(content) = tokio::fs::read_to_string(&table).await else {
             continue;
         };
         for lib in parse_lib_table(&content) {
             if lib["nickname"].as_str() == Some(nick) {
-                if let Some(uri) = lib["uri"].as_str().filter(|u| !u.starts_with("${")) {
-                    return Some(PathBuf::from(uri));
+                if let Some(uri) = lib["uri"].as_str() {
+                    // KiCAD writes every stock entry as
+                    // `${KICAD10_SYMBOL_DIR}/Foo.kicad_sym` and defines those
+                    // variables internally, not in the environment this server
+                    // inherits. Rejecting `${`-prefixed URIs made every stock
+                    // library unresolvable by nickname.
+                    let path = expand_kicad_vars(Path::new(uri));
+                    if path.exists() {
+                        return Some(path);
+                    }
                 }
             }
         }
@@ -1562,11 +1666,10 @@ async fn handle_search_symbols(
 
     let mut results = Vec::new();
     'outer: for (nickname, uri) in entries {
-        // Skip KiCad env-var URIs (${KICAD*_SYMBOL_DIR}) — unresolvable here.
-        if uri.starts_with("${") {
-            continue;
-        }
-        let lib_path = PathBuf::from(&uri);
+        // KiCAD writes EVERY stock entry as `${KICAD10_SYMBOL_DIR}/Foo.kicad_sym`,
+        // so skipping `${`-prefixed URIs skipped the entire stock library table
+        // and searched nothing at all.
+        let lib_path = expand_kicad_vars(Path::new(&uri));
         if !lib_path.exists() {
             continue;
         }
@@ -2534,5 +2637,210 @@ mod tests {
             konnect_sexp::parser::parse_sexp(&c).is_ok(),
             "multi-unit symbol doesn't parse"
         );
+    }
+
+    // ─── Tab-indented library fixtures ──────────────────────────────────────
+    //
+    // KiCAD 10 writes `.kicad_sym` with TAB indentation. Every fixture in this
+    // section uses tabs on purpose: space-indented fixtures are precisely why
+    // the hardcoded `"  (symbol \""` matchers shipped and why search/delete
+    // silently did nothing on every real library.
+
+    fn tab_lib() -> String {
+        [
+            "(kicad_symbol_lib",
+            "\t(version 20251024)",
+            "\t(generator \"kicad_symbol_editor\")",
+            "\t(symbol \"C\"",
+            "\t\t(property \"Reference\" \"C\"",
+            "\t\t\t(at 0.635 2.54 0)",
+            "\t\t)",
+            "\t\t(symbol \"C_0_1\"",
+            "\t\t\t(polyline",
+            "\t\t\t\t(pts (xy -2.032 -0.762) (xy 2.032 -0.762))",
+            "\t\t\t)",
+            "\t\t)",
+            "\t)",
+            "\t(symbol \"C_Polarized\"",
+            "\t\t(property \"Reference\" \"C\"",
+            "\t\t\t(at 0.762 2.54 0)",
+            "\t\t)",
+            "\t\t(symbol \"C_Polarized_0_1\"",
+            "\t\t\t(rectangle",
+            "\t\t\t\t(start -2.286 0.508)",
+            "\t\t\t\t(end 2.286 1.016)",
+            "\t\t\t)",
+            "\t\t)",
+            "\t)",
+            // The description embeds a parenthesised, escaped-quote string so the
+            // scan has to be genuinely string-aware, not just brace-counting.
+            "\t(symbol \"D_Schottky\"",
+            "\t\t(property \"Description\" \"Schottky diode (symbol \\\"D\\\")\"",
+            "\t\t\t(at 0 0 0)",
+            "\t\t)",
+            "\t\t(symbol \"D_Schottky_0_1\"",
+            "\t\t\t(polyline",
+            "\t\t\t\t(pts (xy -1.27 1.27) (xy -1.27 -1.27))",
+            "\t\t\t)",
+            "\t\t)",
+            "\t)",
+            "\t(symbol \"R\"",
+            "\t\t(property \"Reference\" \"R\"",
+            "\t\t\t(at 2.032 0 90)",
+            "\t\t)",
+            "\t)",
+            ")",
+            "",
+        ]
+        .join("\n")
+    }
+
+    /// Names returned by `search_lib_symbols` for `query`, in file order.
+    fn search_names(lib: &str, query: &str) -> Vec<String> {
+        search_lib_symbols("Nick", lib, query)
+            .into_iter()
+            .map(|v| v["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn search_finds_underscore_names_in_a_tab_indented_library() {
+        let lib = tab_lib();
+
+        // The user-reported failure: `search_symbols("D_Schottky")` -> count 0,
+        // because the old scan dropped every name containing '_'.
+        assert_eq!(
+            search_names(&lib, "d_schottky"),
+            vec!["D_Schottky".to_string()]
+        );
+        assert_eq!(
+            search_names(&lib, "c_polarized"),
+            vec!["C_Polarized".to_string()]
+        );
+
+        // A tab-indented library is not invisible: the old `"\n  (symbol \""`
+        // literal matched zero times here.
+        let all = search_names(&lib, "");
+        assert_eq!(
+            all,
+            vec![
+                "C".to_string(),
+                "C_Polarized".to_string(),
+                "D_Schottky".to_string(),
+                "R".to_string()
+            ],
+            "expected every top-level symbol, in file order"
+        );
+    }
+
+    #[test]
+    fn search_excludes_unit_subsymbols_by_depth() {
+        let lib = tab_lib();
+        // `C_0_1` etc. nest inside their parent and must never surface as hits,
+        // and this must hold without resorting to an underscore blacklist.
+        assert!(
+            search_names(&lib, "_0_1").is_empty(),
+            "unit sub-symbols leaked into search results"
+        );
+        for name in search_names(&lib, "c") {
+            assert!(!name.ends_with("_0_1"), "unit sub-symbol {name} in results");
+        }
+    }
+
+    #[test]
+    fn search_is_case_insensitive() {
+        let lib = tab_lib();
+        assert_eq!(
+            search_names(&lib, "schottky"),
+            vec!["D_Schottky".to_string()]
+        );
+    }
+
+    #[test]
+    fn delete_removes_exactly_one_symbol_and_leaves_the_rest_intact() {
+        let lib = tab_lib();
+        let out = delete_symbol_from_content(&lib, "C_Polarized").expect("delete failed");
+
+        assert_eq!(
+            konnect_schematic_editor::library::top_level_symbol_names(&out),
+            vec!["C".to_string(), "D_Schottky".to_string(), "R".to_string()]
+        );
+
+        // The library is still one valid, parseable `kicad_symbol_lib`.
+        konnect_sexp::writer::check_document(&out, "kicad_symbol_lib")
+            .expect("delete produced an invalid library");
+        assert!(konnect_sexp::parser::parse_sexp(&out).is_ok());
+
+        // Every surviving symbol is byte-for-byte what it was.
+        for keep in ["C", "D_Schottky", "R"] {
+            let before = konnect_schematic_editor::library::extract_symbol_block(&lib, keep);
+            let after = konnect_schematic_editor::library::extract_symbol_block(&out, keep);
+            assert_eq!(before, after, "symbol {keep} was altered by the delete");
+        }
+
+        // Only the deleted block's bytes went away — nothing was truncated, and
+        // the header survived. A previous bug fell back to offset 0 and erased
+        // an entire file.
+        let block_len =
+            konnect_schematic_editor::library::extract_symbol_block(&lib, "C_Polarized")
+                .unwrap()
+                .len();
+        assert_eq!(
+            out.len(),
+            lib.len() - block_len - "\n\t".len(), // the block plus its leading newline+tab
+            "delete removed the wrong number of bytes"
+        );
+        assert!(out.starts_with("(kicad_symbol_lib\n\t(version 20251024)"));
+        assert!(!out.contains("C_Polarized"));
+        // Leading whitespace went with the block: no orphaned blank line.
+        assert!(!out.contains("\n\n"), "delete left a blank line behind");
+        assert!(!out.contains("\n\t\n"), "delete left orphaned indentation");
+    }
+
+    #[test]
+    fn delete_handles_first_and_last_symbols() {
+        let lib = tab_lib();
+        for (target, remaining) in [
+            ("C", vec!["C_Polarized", "D_Schottky", "R"]),
+            ("R", vec!["C", "C_Polarized", "D_Schottky"]),
+        ] {
+            let out = delete_symbol_from_content(&lib, target)
+                .unwrap_or_else(|e| panic!("delete {target} failed: {e}"));
+            assert_eq!(
+                konnect_schematic_editor::library::top_level_symbol_names(&out),
+                remaining
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>()
+            );
+            konnect_sexp::writer::check_document(&out, "kicad_symbol_lib")
+                .unwrap_or_else(|e| panic!("delete {target} corrupted the library: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn delete_of_a_unit_subsymbol_or_unknown_name_is_refused() {
+        let lib = tab_lib();
+        // Never silently succeed by truncating at offset 0.
+        assert!(delete_symbol_from_content(&lib, "Nonexistent").is_err());
+        // A unit sub-symbol is not a deletable top-level symbol.
+        assert!(delete_symbol_from_content(&lib, "C_Polarized_0_1").is_err());
+        // A prefix of a real name must not match a different symbol.
+        assert!(delete_symbol_from_content(&lib, "C_Pol").is_err());
+    }
+
+    #[test]
+    fn delete_survives_repeated_application() {
+        // Deleting every symbol one at a time must leave a valid empty library
+        // rather than progressively corrupting the file.
+        let mut lib = tab_lib();
+        for name in ["C", "C_Polarized", "D_Schottky", "R"] {
+            lib = delete_symbol_from_content(&lib, name)
+                .unwrap_or_else(|e| panic!("delete {name} failed: {e}"));
+            konnect_sexp::writer::check_document(&lib, "kicad_symbol_lib")
+                .unwrap_or_else(|e| panic!("library invalid after deleting {name}: {e:?}"));
+        }
+        assert!(konnect_schematic_editor::library::top_level_symbol_names(&lib).is_empty());
+        assert!(lib.contains("(version 20251024)"), "header was destroyed");
     }
 }

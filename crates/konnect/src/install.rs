@@ -323,7 +323,7 @@ fn patch_claude_settings(exe_str: &str) -> Result<usize> {
 
     let hooks_obj = settings
         .as_object_mut()
-        .unwrap()
+        .context("settings.json does not contain a JSON object")?
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
@@ -338,26 +338,46 @@ fn patch_claude_settings(exe_str: &str) -> Result<usize> {
             .as_array_mut()
             .context("hook event field is not an array")?;
 
-        // Idempotent: skip if a hook with this matcher already exists
-        let already_exists = event_arr.iter().any(|h| {
-            h.get("matcher")
-                .and_then(|m| m.as_str())
-                .map(|m| m.contains(hook.name))
-                .unwrap_or(false)
+        // `serde_json` escapes on serialize, so the path goes in verbatim —
+        // pre-escaping it wrote doubled backslashes into the saved command.
+        let command = format!("{} skill {}", exe_str, hook.name);
+
+        // Identify our entry by its command (`… skill <name>`), not by the
+        // matcher: the matcher is a tool-name regex and never contains the
+        // hook's name, so this check never fired and every `konnect init`
+        // appended a duplicate that then ran the hook twice per tool call.
+        let existing = event_arr.iter_mut().find(|h| {
+            h.get("hooks")
+                .and_then(|hs| hs.as_array())
+                .is_some_and(|hs| {
+                    hs.iter().any(|e| {
+                        e.get("command")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(|c| c.ends_with(&format!(" skill {}", hook.name)))
+                    })
+                })
         });
 
-        if !already_exists {
-            // Use the exe path with escaped backslashes for the command
-            let exe_escaped = exe_str.replace('\\', "\\\\");
-            let entry = serde_json::json!({
-                "matcher": hook.tool_matcher,
-                "hooks": [{
+        match existing {
+            // Already installed — refresh the path in place so a moved or
+            // rebuilt binary is picked up without growing the list.
+            Some(entry) => {
+                entry["matcher"] = serde_json::json!(hook.tool_matcher);
+                entry["hooks"] = serde_json::json!([{
                     "type": "command",
-                    "command": format!("{} skill {}", exe_escaped, hook.name)
-                }]
-            });
-            event_arr.push(entry);
-            added += 1;
+                    "command": command
+                }]);
+            }
+            None => {
+                event_arr.push(serde_json::json!({
+                    "matcher": hook.tool_matcher,
+                    "hooks": [{
+                        "type": "command",
+                        "command": command
+                    }]
+                }));
+                added += 1;
+            }
         }
     }
 
@@ -378,15 +398,22 @@ fn remove_hooks_from_settings() -> Result<()> {
     if let Some(hooks_obj) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
         for hook in HOOK_SKILLS {
             if let Some(event_arr) = hooks_obj.get_mut(hook.event).and_then(|a| a.as_array_mut()) {
+                // Match the exact hook we install (`… skill <name>`). The old
+                // test was `command.contains("konnect")`, which also deleted a
+                // user's own hooks whose command merely mentioned Konnect —
+                // or lived under any path containing the string.
+                let suffix = format!(" skill {}", hook.name);
                 event_arr.retain(|h| {
                     let is_ours = h
                         .get("hooks")
                         .and_then(|hooks| hooks.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|h| h.get("command"))
-                        .and_then(|c| c.as_str())
-                        .map(|c| c.contains("konnect"))
-                        .unwrap_or(false);
+                        .is_some_and(|arr| {
+                            arr.iter().any(|e| {
+                                e.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .is_some_and(|c| c.ends_with(&suffix))
+                            })
+                        });
                     !is_ours
                 });
             }

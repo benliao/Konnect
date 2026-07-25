@@ -107,6 +107,87 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
     Ok(())
 }
 
+/// Write a KiCAD document only if it survives a round-trip re-parse.
+///
+/// Every tool here edits KiCAD files as raw string splices, so a mis-computed
+/// offset does not fail loudly — it writes a structurally different file that
+/// KiCAD then refuses to open. Re-reading our own output before it replaces the
+/// user's file turns that class of bug into a failed tool call instead of an
+/// unopenable project.
+///
+/// `expect_root` is the document's required root tag (`kicad_sch`, `kicad_pcb`).
+/// Checks: the text parses, there is exactly one top-level block, its tag is
+/// `expect_root`, and parens balance outside of quoted strings.
+pub fn write_atomic_checked(
+    path: &Path,
+    content: &str,
+    expect_root: &str,
+) -> Result<(), SexpError> {
+    check_document(content, expect_root)?;
+    write_atomic(path, content)
+}
+
+/// The structural checks behind [`write_atomic_checked`], separated so callers
+/// can validate a candidate edit before deciding what to do about it.
+pub fn check_document(content: &str, expect_root: &str) -> Result<(), SexpError> {
+    // Paren balance, ignoring anything inside quoted strings.
+    let bytes = content.as_bytes();
+    let (mut depth, mut i) = (0i64, 0usize);
+    let mut closed_at = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'(' => {
+                if depth == 0 && closed_at.is_some() {
+                    return Err(SexpError::InvalidValue(
+                        "document has more than one top-level block".into(),
+                    ));
+                }
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(SexpError::InvalidValue(format!(
+                        "unbalanced ')' at byte {i}"
+                    )));
+                }
+                if depth == 0 {
+                    closed_at = Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    if depth != 0 {
+        return Err(SexpError::InvalidValue(format!(
+            "{depth} unclosed '(' at end of document"
+        )));
+    }
+    if closed_at.is_none() {
+        return Err(SexpError::InvalidValue("document is empty".into()));
+    }
+
+    let tree = crate::parser::parse_sexp(content)?;
+    match tree.head() {
+        Some(t) if t == expect_root => Ok(()),
+        Some(t) => Err(SexpError::InvalidValue(format!(
+            "root tag is '{t}', expected '{expect_root}'"
+        ))),
+        None => Err(SexpError::InvalidValue(format!(
+            "document has no '{expect_root}' root tag"
+        ))),
+    }
+}
+
 // ─── Balanced-Paren Block Finder ─────────────────────────────────────────────
 
 /// Find the byte range of the balanced-paren S-expression block starting at
@@ -246,6 +327,60 @@ pub fn find_enclosing_block(content: &str, tag: &str, pos: usize) -> Option<(usi
         .find_map(|start| find_balanced_block(content, start).filter(|&(_, end)| end > pos))
 }
 
+/// Byte range of the *top-level* item enclosing `pos` — the block one level
+/// inside the document root, e.g. the `(symbol …)` or `(wire …)` that owns a
+/// nested `(uuid …)`.
+///
+/// Indentation-agnostic, unlike walking back to a literal `"\n  ("`: KiCAD
+/// indents with tabs, so a fixed-width literal finds nothing in eeschema-saved
+/// files. Returns `None` if `pos` is outside the root block or is the root's
+/// own direct content.
+pub fn find_top_level_item(content: &str, pos: usize) -> Option<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let (mut depth, mut i) = (0usize, 0usize);
+    let mut in_string = false;
+    let mut escape_next = false;
+    // The most recent depth-1 → depth-2 opening seen before `pos`.
+    let mut candidate = None;
+
+    while i < bytes.len() && i <= pos {
+        let b = bytes[i];
+        if escape_next {
+            escape_next = false;
+        } else if in_string {
+            if b == b'\\' {
+                escape_next = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'(' => {
+                    // depth 1 is the document root, so its direct children —
+                    // the top-level items — open while depth == 1.
+                    if depth == 1 {
+                        candidate = Some(i);
+                    }
+                    depth += 1;
+                }
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    // Left the candidate item without reaching `pos`; it does
+                    // not enclose it after all.
+                    if depth <= 1 {
+                        candidate = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+
+    candidate.and_then(|start| find_balanced_block(content, start))
+}
+
 // ─── UUID Generation ─────────────────────────────────────────────────────────
 
 /// Generate a new KiCAD-compatible UUID string.
@@ -359,5 +494,95 @@ mod block_start_tests {
         // Tag that isn't present at all.
         let pos = TABS.find("\"R1\"").unwrap();
         assert!(find_enclosing_block(TABS, "wire", pos).is_none());
+    }
+
+    #[test]
+    fn check_document_rejects_the_add_layer_corruption() {
+        // The exact shape add_layer produced (copied from a real corrupted
+        // board): the new rows were spliced in before F.Cu's closing paren, so
+        // they became its children.
+        let nested = "(kicad_pcb\n\t(layers\n\t\t(0 \"F.Cu\" signal\n    (1 \"In1.Cu\" power\n    (1 \"In2.Cu\" power)))\n\t\t(2 \"B.Cu\" signal)\n\t)\n)\n";
+        // Note this text IS paren-balanced with a single correct root — the
+        // nesting is structural, not lexical. So the cheap document check
+        // cannot catch it, which is exactly why add_layer additionally
+        // validates the layer table (flat rows, unique ids, unique names).
+        assert!(
+            check_document(nested, "kicad_pcb").is_ok(),
+            "the corruption balances — document-level checks alone are not enough"
+        );
+
+        // The checks that DO fire:
+        assert!(check_document("(kicad_pcb\n\t(layers\n\t)\n", "kicad_pcb").is_err(), "unclosed paren");
+        assert!(check_document("(kicad_pcb)\n(kicad_pcb)\n", "kicad_pcb").is_err(), "two roots");
+        assert!(check_document("(kicad_sch)\n", "kicad_pcb").is_err(), "wrong root tag");
+        assert!(check_document("", "kicad_pcb").is_err(), "empty");
+        assert!(check_document("(kicad_pcb))\n", "kicad_pcb").is_err(), "extra close");
+    }
+
+    #[test]
+    fn check_document_ignores_parens_inside_strings() {
+        // A property value with an unmatched paren must not look unbalanced.
+        let doc = "(kicad_sch\n\t(property \"D\" \"scheme (pin number consists of\")\n)\n";
+        assert!(check_document(doc, "kicad_sch").is_ok(), "string contents are data");
+    }
+
+    #[test]
+    fn check_document_accepts_a_real_tab_indented_document() {
+        let doc = "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n)\n";
+        assert!(check_document(doc, "kicad_sch").is_ok());
+    }
+
+    /// A nested `(uuid …)` must resolve to the whole top-level item that owns
+    /// it, whichever way the file is indented.
+    #[test]
+    fn top_level_item_found_from_a_nested_position_at_any_indentation() {
+        for (label, content) in [("tabs", TABS), ("spaces", SPACES)] {
+            let pos = content.find("Reference").unwrap();
+            let (s, e) = find_top_level_item(content, pos)
+                .unwrap_or_else(|| panic!("{label}: no enclosing top-level item"));
+            assert!(
+                content[s..e].starts_with("(symbol"),
+                "{label}: {}",
+                &content[s..e]
+            );
+            assert!(content[s..e].ends_with(')'), "{label}: block not balanced");
+            // The whole symbol, not just the inner property.
+            assert!(content[s..e].contains("lib_id"), "{label}: block truncated");
+        }
+    }
+
+    #[test]
+    fn top_level_item_picks_the_owning_sibling_not_a_previous_one() {
+        let doc =
+            "(kicad_sch\n\t(symbol\n\t\t(uuid \"aaa\")\n\t)\n\t(wire\n\t\t(uuid \"bbb\")\n\t)\n)";
+        let pos = doc.find("bbb").unwrap();
+        let (s, e) = find_top_level_item(doc, pos).unwrap();
+        assert!(doc[s..e].starts_with("(wire"), "{}", &doc[s..e]);
+        assert!(
+            !doc[s..e].contains("aaa"),
+            "leaked into the previous sibling"
+        );
+    }
+
+    /// Content belonging to the root itself has no enclosing top-level item,
+    /// and neither does an offset past the end of the document.
+    #[test]
+    fn top_level_item_declines_root_level_and_out_of_range_positions() {
+        let doc = "(kicad_sch\n\t(version 20250610)\n)";
+        assert_eq!(
+            find_top_level_item(doc, doc.find("kicad_sch").unwrap()),
+            None
+        );
+        assert_eq!(find_top_level_item(doc, doc.len() + 50), None);
+    }
+
+    /// A paren inside a quoted string must not be counted as nesting, or the
+    /// depth tracking drifts and the wrong block gets returned.
+    #[test]
+    fn top_level_item_ignores_parens_inside_strings() {
+        let doc = "(kicad_sch\n\t(text \"a (b\")\n\t(symbol\n\t\t(uuid \"zzz\")\n\t)\n)";
+        let pos = doc.find("zzz").unwrap();
+        let (s, e) = find_top_level_item(doc, pos).unwrap();
+        assert!(doc[s..e].starts_with("(symbol"), "{}", &doc[s..e]);
     }
 }

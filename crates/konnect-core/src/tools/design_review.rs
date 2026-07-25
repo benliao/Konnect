@@ -11,7 +11,9 @@ use crate::tools::{get_path, ToolContext, ToolDef};
 use konnect_schematic_editor as cse;
 use konnect_sexp::{
     parser::parse_sexp,
-    schematic::{extract_lib_pins, extract_symbol_instances, pin_endpoint, read_schematic},
+    schematic::{
+        extract_lib_pins_resolved, extract_symbol_instances, pin_endpoint, read_schematic,
+    },
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -163,7 +165,11 @@ async fn handle_audit_decoupling(
             None => continue,
         };
 
-        let pins = extract_lib_pins(lib_sym);
+        // `_resolved` follows `(extends "Parent")`. Derived KiCAD parts
+        // (Regulator_Linear:XC6206PxxxMR, Transistor_FET:2N7002, …) hold no
+        // pins of their own, so the unresolved scan saw zero power pins on
+        // them and the audit silently passed every such IC.
+        let pins = extract_lib_pins_resolved(lib_sym, &lib_syms);
         let is_passive = inst.lib_id.contains("R_")
             || inst.lib_id.contains("C_")
             || inst.lib_id.contains("L_")
@@ -263,7 +269,7 @@ async fn handle_audit_connections(
             None => continue,
         };
 
-        let pins = extract_lib_pins(lib_sym);
+        let pins = extract_lib_pins_resolved(lib_sym, &lib_syms);
 
         // Check for I2C pull-ups
         if has_i2c_pins(&pins) {
@@ -763,7 +769,7 @@ fn collect_capacitor_nets(
             .iter()
             .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
         if let Some(sym) = lib_sym {
-            let pins = extract_lib_pins(sym);
+            let pins = extract_lib_pins_resolved(sym, lib_syms);
             for pin in &pins {
                 let (px, py) = pin_endpoint(pin, inst.pin_transform());
                 if let Some(net) = find_net_at_point(content, px, py) {
@@ -807,7 +813,7 @@ fn collect_bulk_cap_nets(
             .iter()
             .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
         if let Some(sym) = lib_sym {
-            let pins = extract_lib_pins(sym);
+            let pins = extract_lib_pins_resolved(sym, lib_syms);
             for pin in &pins {
                 let (px, py) = pin_endpoint(pin, inst.pin_transform());
                 if let Some(net) = find_net_at_point(content, px, py) {
@@ -923,7 +929,7 @@ fn has_pull_up_on_net(
             .iter()
             .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
         if let Some(sym) = lib_sym {
-            let pins = extract_lib_pins(sym);
+            let pins = extract_lib_pins_resolved(sym, lib_syms);
             let pin_nets: Vec<Option<String>> = pins
                 .iter()
                 .map(|p| {

@@ -10,10 +10,13 @@ use crate::tools::{get_path, ToolContext, ToolDef};
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires, pin_endpoint,
-        read_schematic,
+        extract_labels, extract_lib_pins_resolved, extract_symbol_instances, extract_wires,
+        pin_endpoint, read_schematic,
     },
-    writer::{apply_edits, find_block_with_leading_whitespace, write_atomic, SexpEdit},
+    writer::{
+        apply_edits, find_balanced_block, find_block_starts, find_enclosing_block,
+        write_atomic_checked, SexpEdit,
+    },
 };
 use serde_json::json;
 
@@ -216,7 +219,10 @@ async fn handle_export_netlist_summary(
 
             let pins: Vec<serde_json::Value> = if let Some(sym) = lib_sym {
                 let t = inst.pin_transform();
-                extract_lib_pins(sym)
+                // `_resolved` follows `(extends "Parent")`: derived parts such
+                // as Transistor_FET:2N7002 carry no pins of their own, so the
+                // netlist listed them with zero pins (S3-2).
+                extract_lib_pins_resolved(sym, &lib_syms)
                     .iter()
                     .map(|p| {
                         let (px, py) = pin_endpoint(p, t);
@@ -334,7 +340,9 @@ async fn handle_fix_connectivity(
             .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
-            for pin in extract_lib_pins(sym) {
+            // Derived symbols inherit their pins — without resolving, their
+            // pins were missing from the snap targets entirely.
+            for pin in extract_lib_pins_resolved(sym, &lib_syms) {
                 snap_targets.push(pin_endpoint(&pin, t));
             }
         }
@@ -380,54 +388,257 @@ async fn handle_fix_connectivity(
             });
 
             if let Some(&(tx, ty)) = near {
+                // Only claim a fix was applied once the edit has actually been
+                // located: `fixes` is pushed unconditionally, so deriving
+                // `applied` from it reported success on files where not one
+                // byte was written.
+                let mut edit_made = false;
+                if !dry_run {
+                    if let Some(edit) = w
+                        .uuid
+                        .as_deref()
+                        .and_then(|u| wire_endpoint_edit(&content, u, *is_start, tx, ty))
+                    {
+                        file_edits.push(edit);
+                        edit_made = true;
+                    }
+                }
+
                 fixes.push(json!({
                     "wire_uuid": w.uuid,
                     "endpoint": if *is_start { "start" } else { "end" },
                     "from": { "x": px, "y": py },
-                    "to":   { "x": tx, "y": ty }
+                    "to":   { "x": tx, "y": ty },
+                    "applied": edit_made
                 }));
-
-                if !dry_run {
-                    // Find the wire block by UUID and replace the coordinate
-                    if let Some(uuid_str) = &w.uuid {
-                        let uuid_pat = format!(r#"(uuid "{uuid_str}")"#);
-                        if let Some(uuid_pos) = content.find(&uuid_pat) {
-                            let before = &content[..uuid_pos];
-                            if let Some(ws) = before.rfind("\n  (wire").map(|p| p + 1) {
-                                if let Some((wbs, wbe)) =
-                                    find_block_with_leading_whitespace(&content, ws)
-                                {
-                                    let wire_block = &content[wbs..wbe];
-                                    let coord_prefix = if *is_start { "(start " } else { "(end " };
-                                    if let Some(coord_rel) = wire_block.find(coord_prefix) {
-                                        let vals_abs = wbs + coord_rel + coord_prefix.len();
-                                        let close_rel =
-                                            wire_block[coord_rel..].find(')').unwrap_or(0);
-                                        let vals_end = wbs + coord_rel + close_rel;
-                                        file_edits.push(SexpEdit::replace(
-                                            vals_abs,
-                                            vals_end,
-                                            format!("{tx} {ty}"),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
     }
 
+    let fixes_applied = file_edits.len();
+    let mut applied = false;
     if !dry_run && !file_edits.is_empty() {
         let new_content = apply_edits(content, file_edits);
-        write_atomic(&sch_path, &new_content)?;
+        // Validate before replacing the user's schematic: a mis-computed
+        // offset must fail the call, not produce an unopenable file.
+        write_atomic_checked(&sch_path, &new_content, "kicad_sch")?;
+        applied = true;
     }
 
-    Ok(CallToolResult::json(&json!({
+    let mut result = json!({
         "fixes_found": fixes.len(),
-        "applied": !dry_run && !fixes.is_empty(),
+        "fixes_applied": fixes_applied,
+        "applied": applied,
         "dry_run": dry_run,
         "fixes": fixes
-    })))
+    });
+    if !dry_run && fixes_applied < result["fixes_found"].as_u64().unwrap_or(0) as usize {
+        result["note"] = json!(
+            "Some near-miss endpoints could not be located in the file and were left unchanged."
+        );
+    }
+
+    Ok(CallToolResult::json(&result))
+}
+
+/// Byte-range edit that moves one endpoint of the wire carrying `uuid` to
+/// (`tx`, `ty`). Returns `None` when the wire or its coordinate cannot be
+/// located, so the caller never reports an edit it did not make.
+///
+/// Indentation-agnostic (KiCAD writes tabs, this crate wrote two spaces) and
+/// handles both the KiCAD 10 `(pts (xy …) (xy …))` form and the legacy
+/// `(start …)` / `(end …)` form.
+fn wire_endpoint_edit(
+    content: &str,
+    uuid: &str,
+    is_start: bool,
+    tx: f64,
+    ty: f64,
+) -> Option<SexpEdit> {
+    let uuid_pos = content.find(&format!(r#"(uuid "{uuid}")"#))?;
+    let (wbs, wbe) = find_enclosing_block(content, "wire", uuid_pos)?;
+    let wire_block = &content[wbs..wbe];
+
+    // KiCAD 10: (wire (pts (xy X Y) (xy X Y)) …)
+    if let Some(&pts_rel) = find_block_starts(wire_block, "pts").first() {
+        let (pbs, pbe) = find_balanced_block(wire_block, pts_rel)?;
+        let pts_block = &wire_block[pbs..pbe];
+        let xy_starts = find_block_starts(pts_block, "xy");
+        let &xy_rel = xy_starts.get(if is_start { 0 } else { 1 })?;
+        let (xs, xe) = find_balanced_block(pts_block, xy_rel)?;
+        return Some(SexpEdit::replace(
+            wbs + pbs + xs,
+            wbs + pbs + xe,
+            format!("(xy {tx} {ty})"),
+        ));
+    }
+
+    // KiCAD 8/9: (wire (start X Y) (end X Y) …)
+    let tag = if is_start { "start" } else { "end" };
+    let &tag_rel = find_block_starts(wire_block, tag).first()?;
+    let (ts, te) = find_balanced_block(wire_block, tag_rel)?;
+    Some(SexpEdit::replace(
+        wbs + ts,
+        wbs + te,
+        format!("({tag} {tx} {ty})"),
+    ))
+}
+
+#[cfg(test)]
+mod fix_connectivity_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// TAB-indented, as eeschema writes it. The old `rfind("\n  (wire")`
+    /// matched nothing here, so every "fix" was a silent no-op.
+    fn tab_schematic() -> String {
+        [
+            "(kicad_sch",
+            "\t(version 20250610)",
+            "\t(generator \"eeschema\")",
+            "\t(uuid \"22222222-2222-2222-2222-222222222222\")",
+            "\t(paper \"A4\")",
+            "\t(lib_symbols",
+            "\t)",
+            "\t(wire",
+            "\t\t(pts",
+            "\t\t\t(xy 100 100) (xy 110 100)",
+            "\t\t)",
+            "\t\t(stroke",
+            "\t\t\t(width 0)",
+            "\t\t\t(type default)",
+            "\t\t)",
+            "\t\t(uuid \"aaaaaaaa-0000-0000-0000-000000000001\")",
+            "\t)",
+            "\t(label \"NET1\"",
+            "\t\t(at 110.02 100 0)",
+            "\t\t(uuid \"bbbbbbbb-0000-0000-0000-000000000002\")",
+            "\t)",
+            ")",
+            "",
+        ]
+        .join("\n")
+    }
+
+    fn result_json(res: &CallToolResult) -> serde_json::Value {
+        match &res.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => serde_json::from_str(text).unwrap(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    fn write_temp(content: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "konnect-fixconn-{}",
+            konnect_sexp::writer::new_uuid()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.kicad_sch");
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn applies_edit_to_tab_indented_schematic() {
+        let (dir, path) = write_temp(&tab_schematic());
+        let args = json!({ "schematic": path.to_str().unwrap(), "snap_tolerance": 0.05 });
+
+        let res = handle_fix_connectivity(&args, &test_ctx()).await.unwrap();
+        let out = result_json(&res);
+
+        assert_eq!(out["fixes_found"], 1, "{out}");
+        assert_eq!(out["fixes_applied"], 1, "{out}");
+        assert_eq!(out["applied"], true, "{out}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(xy 110.02 100)"),
+            "endpoint was not moved: {after}"
+        );
+        assert!(after.contains("(xy 100 100)"), "other endpoint disturbed");
+        konnect_sexp::writer::check_document(&after, "kicad_sch").unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_not_applied_and_leaves_file_alone() {
+        let original = tab_schematic();
+        let (dir, path) = write_temp(&original);
+        let args = json!({
+            "schematic": path.to_str().unwrap(),
+            "snap_tolerance": 0.05,
+            "dry_run": true
+        });
+
+        let res = handle_fix_connectivity(&args, &test_ctx()).await.unwrap();
+        let out = result_json(&res);
+
+        assert_eq!(out["fixes_found"], 1, "{out}");
+        assert_eq!(out["applied"], false, "{out}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn applied_is_false_when_no_edit_can_be_located() {
+        // Wire without a uuid: a fix is identifiable but not addressable.
+        let sch =
+            tab_schematic().replace("\t\t(uuid \"aaaaaaaa-0000-0000-0000-000000000001\")\n", "");
+        let (dir, path) = write_temp(&sch);
+        let args = json!({ "schematic": path.to_str().unwrap(), "snap_tolerance": 0.05 });
+
+        let res = handle_fix_connectivity(&args, &test_ctx()).await.unwrap();
+        let out = result_json(&res);
+
+        assert_eq!(out["fixes_found"], 1, "{out}");
+        assert_eq!(out["fixes_applied"], 0, "{out}");
+        assert_eq!(
+            out["applied"], false,
+            "reported success without writing anything: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), sch);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wire_endpoint_edit_handles_tabs_and_legacy_format() {
+        let sch = tab_schematic();
+        let edit = wire_endpoint_edit(
+            &sch,
+            "aaaaaaaa-0000-0000-0000-000000000001",
+            false,
+            110.02,
+            100.0,
+        )
+        .expect("tab-indented wire must be found");
+        assert_eq!(&sch[edit.start..edit.end], "(xy 110 100)");
+
+        // KiCAD 8/9 form, two-space indented.
+        let legacy = "(kicad_sch\n  (wire (start 1 2) (end 3 4) (uuid \"w9\"))\n)\n";
+        let edit = wire_endpoint_edit(legacy, "w9", true, 5.0, 6.0).unwrap();
+        assert_eq!(&legacy[edit.start..edit.end], "(start 1 2)");
+        assert_eq!(edit.replacement, "(start 5 6)");
+
+        assert!(wire_endpoint_edit(&sch, "no-such-uuid", true, 0.0, 0.0).is_none());
+        // A uuid that belongs to a label, not a wire.
+        assert!(
+            wire_endpoint_edit(&sch, "bbbbbbbb-0000-0000-0000-000000000002", true, 0.0, 0.0)
+                .is_none()
+        );
+    }
 }

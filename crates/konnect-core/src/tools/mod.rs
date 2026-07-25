@@ -25,6 +25,7 @@ pub mod verification;
 
 use crate::mcp::protocol::{CallToolResult, McpToolDescription};
 use crate::router::ToolRouter;
+use konnect_sexp::writer::SexpEdit;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -356,6 +357,95 @@ pub fn find_symbol_instance_block(content: &str, reference: &str) -> Option<(usi
     None
 }
 
+/// How a rename landed: how many `(symbol …)` blocks were renamed (a multi-unit
+/// part has one per unit) and how many instance entries were rewritten.
+pub struct RenameOutcome {
+    pub units: usize,
+    pub instances: usize,
+}
+
+/// Byte edits that rename a component, updating **both** places KiCAD 6+ stores
+/// a designator.
+///
+/// A designator lives in the `Reference` property (what eeschema draws) *and*
+/// in the per-sheet instance entry
+/// `(instances (project … (path … (reference "…") (unit N))))` — and it is the
+/// instance entry that the netlister and "Update PCB from Schematic" read.
+/// Rewriting only the property leaves the two disagreeing, so PCB sync keeps
+/// failing on the *old* designator.
+///
+/// Returns edits rather than new content so a batch handler can fold them in
+/// with its other `SexpEdit`s and apply everything in one pass. Every offset is
+/// relative to the `content` passed in: the scan walks forward past each symbol
+/// block it has handled instead of re-searching rewritten text, so multi-unit
+/// parts — which repeat the designator across one block per unit — are renamed
+/// completely without invalidating the offsets already collected.
+///
+/// All block matching is indentation-agnostic: eeschema/KiCAD 10 writes tabs
+/// while this crate's writer writes two spaces, so no matcher may assume either.
+pub fn rename_symbol_edits(
+    content: &str,
+    old: &str,
+    new: &str,
+) -> Result<(Vec<SexpEdit>, RenameOutcome), String> {
+    use konnect_sexp::writer::{find_balanced_block, find_block_starts};
+
+    let mut edits = Vec::new();
+    let mut outcome = RenameOutcome {
+        units: 0,
+        instances: 0,
+    };
+    let mut cursor = 0usize;
+
+    while let Some((rel_start, rel_end)) = find_symbol_instance_block(&content[cursor..], old) {
+        let (sym_start, sym_end) = (cursor + rel_start, cursor + rel_end);
+        cursor = sym_end;
+        let sym_block = &content[sym_start..sym_end];
+
+        // 1. The Reference property.
+        let field_search = r#"(property "Reference" ""#;
+        let val_start = sym_block
+            .find(field_search)
+            .map(|o| sym_start + o + field_search.len())
+            .ok_or_else(|| format!("'{old}' has no 'Reference' property"))?;
+        let val_end = content[val_start..]
+            .find('"')
+            .map(|o| val_start + o)
+            .ok_or_else(|| format!("'Reference' property on '{old}' is malformed"))?;
+        edits.push(SexpEdit::replace(val_start, val_end, new.to_string()));
+
+        // 2. Every (reference "…") inside this same symbol's instances block.
+        //    Hand-authored or pre-KiCAD-6 symbols carry none; that is not an
+        //    error, just nothing to keep in sync.
+        if let Some(&inst_rel) = find_block_starts(sym_block, "instances").first() {
+            let (inst_start, inst_end) = find_balanced_block(sym_block, inst_rel)
+                .ok_or_else(|| format!("'{old}' has a malformed (instances …) block"))?;
+            let inst_block = &sym_block[inst_start..inst_end];
+            let inst_abs = sym_start + inst_start;
+
+            for rel in find_block_starts(inst_block, "reference") {
+                let rest = &inst_block[rel..];
+                let Some(q_open) = rest.find('"') else {
+                    continue;
+                };
+                let q_len = rest[q_open + 1..]
+                    .find('"')
+                    .ok_or_else(|| format!("'{old}' has a malformed instance (reference …)"))?;
+                let start = inst_abs + rel + q_open + 1;
+                edits.push(SexpEdit::replace(start, start + q_len, new.to_string()));
+                outcome.instances += 1;
+            }
+        }
+
+        outcome.units += 1;
+    }
+
+    if outcome.units == 0 {
+        return Err(format!("symbol '{old}' not found in this schematic"));
+    }
+    Ok((edits, outcome))
+}
+
 #[cfg(test)]
 mod symbol_block_tests {
     use super::*;
@@ -497,91 +587,22 @@ fn kicad_config_base() -> std::path::PathBuf {
 /// Resolve a lib_id like "Device:R" to the full symbol S-expression definition.
 /// KiCAD 10 stores symbols in .kicad_symdir directories, one .kicad_sym file per symbol.
 /// Returns the symbol block with the lib_id prefix (e.g. "Device:R") as the symbol name.
+/// Delegates to `konnect_schematic_editor::library`, which is the single
+/// implementation.
+///
+/// This used to be a second, independently-maintained copy that had drifted:
+/// it counted parens without skipping quoted strings (so any symbol with an
+/// unbalanced paren in a property value failed to resolve), never consulted the
+/// symbol library tables, and — unlike the real implementation — did not prefix
+/// or embed `(extends "Parent")` parents, so `replace_component` wrote derived
+/// symbols KiCAD could not resolve while `add_schematic_component` handled them
+/// correctly.
 pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
-    let parts: Vec<&str> = lib_id.splitn(2, ':').collect();
-    if parts.len() != 2 {
-        tracing::warn!(
-            "[BETA] Cannot resolve lib_id '{}' — expected 'Library:Symbol' format",
-            lib_id
-        );
-        return None;
+    let resolved = konnect_schematic_editor::library::resolve_lib_symbol(lib_id);
+    if resolved.is_none() {
+        tracing::warn!("Symbol '{}' not found in any symbol library", lib_id);
     }
-    let (library_name, symbol_name) = (parts[0], parts[1]);
-
-    let sym_dirs = find_kicad_symbol_dirs();
-
-    for base_dir in &sym_dirs {
-        // KiCAD 10: Library.kicad_symdir/SymbolName.kicad_sym
-        let symdir_path = base_dir.join(format!("{}.kicad_symdir", library_name));
-        let sym_file = symdir_path.join(format!("{}.kicad_sym", symbol_name));
-
-        if sym_file.exists() {
-            tracing::debug!("[BETA] Found symbol file: {}", sym_file.display());
-            match std::fs::read_to_string(&sym_file) {
-                Ok(content) => {
-                    if let Some(sym_block) = extract_symbol_block(&content, symbol_name) {
-                        let renamed = sym_block.replacen(
-                            &format!("(symbol \"{}\"", symbol_name),
-                            &format!("(symbol \"{}:{}\"", library_name, symbol_name),
-                            1,
-                        );
-                        return Some(renamed);
-                    }
-                }
-                Err(e) => tracing::warn!("[BETA] Failed to read {}: {}", sym_file.display(), e),
-            }
-        }
-
-        // Fallback: KiCAD 8/9 format — Library.kicad_sym (single file)
-        let legacy_path = base_dir.join(format!("{}.kicad_sym", library_name));
-        if legacy_path.exists() {
-            match std::fs::read_to_string(&legacy_path) {
-                Ok(content) => {
-                    if let Some(sym_block) = extract_symbol_block(&content, symbol_name) {
-                        let renamed = sym_block.replacen(
-                            &format!("(symbol \"{}\"", symbol_name),
-                            &format!("(symbol \"{}:{}\"", library_name, symbol_name),
-                            1,
-                        );
-                        return Some(renamed);
-                    }
-                }
-                Err(e) => tracing::warn!("[BETA] Failed to read {}: {}", legacy_path.display(), e),
-            }
-        }
-    }
-
-    tracing::warn!(
-        "[BETA] Symbol '{}' not found in any library directory",
-        lib_id
-    );
-    None
-}
-
-/// Extract a top-level (symbol "NAME" ...) block from a .kicad_sym file.
-fn extract_symbol_block(content: &str, symbol_name: &str) -> Option<String> {
-    let pattern = format!("(symbol \"{}\"", symbol_name);
-    let start = content.find(&pattern)?;
-    let mut depth = 0i32;
-    let mut end = start;
-    for (i, ch) in content[start..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = start + i + 1;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    if end > start {
-        Some(content[start..end].to_string())
-    } else {
-        None
-    }
+    resolved
 }
 
 /// Structured "this lib_id doesn't exist" error, with did-you-mean hints —
@@ -669,63 +690,4 @@ pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) -> boo
         content.insert_str(ls_end, &format!("\n{}\n\t", indented));
     }
     true
-}
-
-/// Find directories where KiCAD symbol libraries are stored.
-fn find_kicad_symbol_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(dir) = std::env::var("KICAD10_SYMBOL_DIR") {
-        let p = std::path::PathBuf::from(&dir);
-        if p.is_dir() {
-            dirs.push(p);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let candidates = [
-            r"C:\KiCad\10.0\share\kicad\symbols",
-            r"C:\Program Files\KiCad\10.0\share\kicad\symbols",
-            r"C:\KiCad\9.0\share\kicad\symbols",
-            r"C:\Program Files\KiCad\9.0\share\kicad\symbols",
-        ];
-        for c in &candidates {
-            let p = std::path::PathBuf::from(c);
-            if p.is_dir() && !dirs.contains(&p) {
-                dirs.push(p);
-            }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // KiCad on macOS ships its libraries inside the app bundle.
-        let mut candidates = vec![
-            std::path::PathBuf::from(
-                "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
-            ),
-            std::path::PathBuf::from("/usr/local/share/kicad/symbols"),
-        ];
-        if let Ok(home) = std::env::var("HOME") {
-            // Per-user install (KiCad.app dragged into ~/Applications)
-            candidates.push(
-                std::path::PathBuf::from(home)
-                    .join("Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols"),
-            );
-        }
-        for p in candidates {
-            if p.is_dir() && !dirs.contains(&p) {
-                dirs.push(p);
-            }
-        }
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let candidates = ["/usr/share/kicad/symbols", "/usr/local/share/kicad/symbols"];
-        for c in &candidates {
-            let p = std::path::PathBuf::from(c);
-            if p.is_dir() && !dirs.contains(&p) {
-                dirs.push(p);
-            }
-        }
-    }
-    dirs
 }

@@ -9,10 +9,102 @@ use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
 use konnect_ipc::builders;
 use konnect_sexp::{
-    parser::parse_sexp,
+    parser::{parse_sexp, SexpNode},
     writer::{apply_edits, new_uuid, write_atomic, SexpEdit},
 };
 use serde_json::json;
+
+// ─── Board layer table ───────────────────────────────────────────────────────
+
+/// One row of the board's `(layers ...)` block: `(ID "Name" type ["Alias"])`.
+struct LayerEntry {
+    id: i32,
+    name: String,
+    kind: String,
+}
+
+/// Read the board's layer table.
+///
+/// A row's id is the list **head** (`(0 "F.Cu" signal)`), so rows cannot be
+/// reached with `find_all(tag)` — that matches on the head and would need the
+/// id as the tag. Every child after the `layers` tag is a row.
+fn read_layers(tree: &SexpNode) -> Option<Vec<LayerEntry>> {
+    let node = tree.find("layers")?;
+    Some(
+        node.children()?
+            .iter()
+            .skip(1)
+            .filter_map(|row| {
+                let c = row.children()?;
+                Some(LayerEntry {
+                    id: c.first()?.as_str()?.parse().ok()?,
+                    name: c.get(1)?.as_str()?.to_string(),
+                    kind: c
+                        .get(2)
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("user")
+                        .to_string(),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The canonical id KiCAD assigns to `name`, for the layers this tool may add.
+///
+/// KiCAD does not let a board invent layer ids — each named layer has a fixed
+/// id, and copper owns the even ids below them. Read off a KiCAD 10-written
+/// board.
+fn canonical_layer_id(name: &str) -> Option<i32> {
+    let fixed = [
+        ("F.Mask", 1),
+        ("B.Mask", 3),
+        ("F.SilkS", 5),
+        ("B.SilkS", 7),
+        ("F.Adhes", 9),
+        ("B.Adhes", 11),
+        ("F.Paste", 13),
+        ("B.Paste", 15),
+        ("Dwgs.User", 17),
+        ("Cmts.User", 19),
+        ("Eco1.User", 21),
+        ("Eco2.User", 23),
+        ("Edge.Cuts", 25),
+        ("Margin", 27),
+        ("B.CrtYd", 29),
+        ("F.CrtYd", 31),
+        ("B.Fab", 33),
+        ("F.Fab", 35),
+    ];
+    if let Some((_, id)) = fixed.iter().find(|(n, _)| *n == name) {
+        return Some(*id);
+    }
+    // User.1 … User.9 are the only user-definable layers: id = 37 + 2N.
+    let n: i32 = name.strip_prefix("User.")?.parse().ok()?;
+    (1..=9).contains(&n).then_some(37 + 2 * n)
+}
+
+/// Whether `name` is a copper layer (`F.Cu`, `B.Cu`, `In<N>.Cu`).
+fn is_copper_layer(name: &str) -> bool {
+    name.ends_with(".Cu")
+}
+
+/// KiCAD 10's copper id assignment, for reference and for any future
+/// implementation of copper-count changes:
+///
+/// ```text
+/// F.Cu   = 0
+/// B.Cu   = 2
+/// In<N>.Cu = 2 + 2N   →  In1.Cu = 4, In2.Cu = 6, In3.Cu = 8, …
+/// ```
+///
+/// The odd ids 1..=35 belong to the technical layers (F.Mask = 1, B.Mask = 3,
+/// F.SilkS = 5, …), which is why inner copper starts at 4 rather than 1. The
+/// old code assigned inner layers from 1 upward and collided with F.Mask.
+#[allow(dead_code)]
+fn inner_copper_id(n: i32) -> i32 {
+    2 + 2 * n
+}
 
 // Build the 4 Edge.Cuts segments forming a rectangle, packed as Any for create_items.
 fn rect_outline_items(x1: f64, y1: f64, x2: f64, y2: f64, w: f64) -> Vec<prost_types::Any> {
@@ -197,13 +289,16 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_layer",
-            "Add a new inner copper or technical layer to the board layer stack.",
+            "Enable a technical or user layer on the board (e.g. 'Eco1.User', 'User.1'). \
+             Copper layers are NOT supported: changing the copper layer count requires \
+             renumbering the copper id space and rewriting the board stackup, so it must \
+             be done in KiCAD via Board Setup → Board Stackup → Physical Stackup.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":       { "type": "string" },
-                    "layer_name":  { "type": "string", "description": "KiCAD layer name (e.g. 'In1.Cu')" },
-                    "layer_type":  { "type": "string", "description": "Type: 'signal', 'power', 'mixed', 'jumper'", "default": "signal" }
+                    "layer_name":  { "type": "string", "description": "A KiCAD-defined non-copper layer name: F.Mask, B.Mask, F.SilkS, B.SilkS, F.Adhes, B.Adhes, F.Paste, B.Paste, Dwgs.User, Cmts.User, Eco1.User, Eco2.User, Edge.Cuts, Margin, F.CrtYd, B.CrtYd, F.Fab, B.Fab, User.1 … User.9" },
+                    "layer_type":  { "type": "string", "description": "Layer type recorded in the layer table", "default": "user" }
                 },
                 "required": ["board", "layer_name"]
             }),
@@ -504,8 +599,8 @@ async fn handle_get_layer_list(
     let content = std::fs::read_to_string(&board_path)?;
     let tree = parse_sexp(&content)?;
 
-    let layers_node = match tree.find("layers") {
-        Some(n) => n,
+    let entries = match read_layers(&tree) {
+        Some(e) => e,
         None => {
             return Ok(CallToolResult::error(
                 "No (layers) section found in board file",
@@ -513,20 +608,9 @@ async fn handle_get_layer_list(
         }
     };
 
-    // Each child of layers looks like: (0 "F.Cu" signal)
-    let layers: Vec<serde_json::Value> = layers_node
-        .find_all("")
+    let layers: Vec<serde_json::Value> = entries
         .iter()
-        .filter_map(|node| {
-            let id = node.get_f64(1).map(|n| n as i32)?;
-            let name = node.get(2)?.as_str()?.to_string();
-            let kind = node
-                .get(3)
-                .and_then(|n| n.as_str())
-                .unwrap_or("user")
-                .to_string();
-            Some(json!({ "id": id, "name": name, "type": kind }))
-        })
+        .map(|l| json!({ "id": l.id, "name": l.name, "type": l.kind }))
         .collect();
 
     Ok(CallToolResult::json(
@@ -543,44 +627,179 @@ async fn handle_add_layer(
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
     };
-    let layer_type = args["layer_type"].as_str().unwrap_or("signal");
+    let layer_type = args["layer_type"].as_str().unwrap_or("user");
+
+    // Adding a copper layer is not an append. KiCAD owns the copper id space —
+    // In1.Cu…InN.Cu sit between F.Cu (0) and B.Cu (2), so growing the stack
+    // renumbers existing layers — and the copper count also lives in
+    // (setup (stackup ...)), the pcbplotparams layerselection mask, and
+    // (general (thickness)). Writing a bare (layers) row leaves a board KiCAD
+    // refuses to open, so refuse rather than half-do it.
+    if is_copper_layer(&layer_name) {
+        return Ok(CallToolResult::error(format!(
+            "Refusing to add copper layer '{layer_name}'. In KiCAD 10 the copper \
+             ids are F.Cu=0, B.Cu=2 and In<N>.Cu=2+2N (In1.Cu=4, In2.Cu=6) — the \
+             odd ids 1..35 belong to the technical layers — and the copper count \
+             also lives in (setup (stackup ...)), the pcbplotparams layerselection \
+             mask, and (general (thickness)). This tool updates none of that, so \
+             the result would be a board KiCAD cannot load. Set the copper layer \
+             count in KiCAD instead: File → Board Setup → Board Stackup → \
+             Physical Stackup, set 'Copper layers', then OK."
+        )));
+    }
+
+    let new_id = match canonical_layer_id(&layer_name) {
+        Some(id) => id,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Unknown layer name '{layer_name}'. KiCAD layer ids are fixed, \
+                 not allocated — this tool can only enable a layer KiCAD already \
+                 defines. Valid names: F.Mask, B.Mask, F.SilkS, B.SilkS, F.Adhes, \
+                 B.Adhes, F.Paste, B.Paste, Dwgs.User, Cmts.User, Eco1.User, \
+                 Eco2.User, Edge.Cuts, Margin, F.CrtYd, B.CrtYd, F.Fab, B.Fab, \
+                 User.1 … User.9."
+            )))
+        }
+    };
 
     let content = std::fs::read_to_string(&board_path)?;
+    let tree = parse_sexp(&content)?;
 
-    // Find the (layers ...) block and insert before its closing paren
-    let layers_pos = match content.find("(layers") {
+    let existing = match read_layers(&tree) {
+        Some(e) => e,
+        None => return Ok(CallToolResult::error("No (layers) section found")),
+    };
+    if let Some(dup) = existing.iter().find(|l| l.name == layer_name) {
+        return Ok(CallToolResult::error(format!(
+            "Layer '{layer_name}' is already on the board (id {})",
+            dup.id
+        )));
+    }
+    if let Some(clash) = existing.iter().find(|l| l.id == new_id) {
+        return Ok(CallToolResult::error(format!(
+            "Cannot add '{layer_name}': its KiCAD id {new_id} is already used by \
+             layer '{}'. The board's layer table disagrees with KiCAD's fixed \
+             ids — fix it in KiCAD's Board Setup rather than here.",
+            clash.name
+        )));
+    }
+
+    // Insert before the layers block's own closing paren. Locating it needs a
+    // real balanced scan: the previous indentation-guess ("\n  )") does not
+    // match KiCAD 10's tab-indented output and fell back to the *first* ')' in
+    // the block — the close of the F.Cu row — nesting each new layer inside it
+    // and producing a board KiCAD could not load.
+    let layers_pos = match find_layers_block(&content) {
         Some(p) => p,
         None => return Ok(CallToolResult::error("No (layers) section found")),
     };
+    let (_, layers_end) = match konnect_sexp::writer::find_balanced_block(&content, layers_pos) {
+        Some(r) => r,
+        None => {
+            return Ok(CallToolResult::error(
+                "The (layers) section is not balanced — refusing to edit it",
+            ))
+        }
+    };
+    let close_paren = layers_end - 1;
 
-    // Determine the next available inner copper ID (first unused ID in 1-30 range)
-    let tree = parse_sexp(&content)?;
-    let used_ids: std::collections::HashSet<i32> = tree
-        .find("layers")
-        .map(|n| {
-            n.find_all("")
-                .iter()
-                .filter_map(|node| node.get_f64(1).map(|n| n as i32))
-                .collect()
-        })
-        .unwrap_or_default();
-    let new_id = (1..=30).find(|id| !used_ids.contains(id)).unwrap_or(1);
+    let indent = row_indent(&content, layers_pos);
+    let new_layer = format!("{indent}({new_id} \"{layer_name}\" {layer_type})\n");
+    let new_content = apply_edits(content, vec![SexpEdit::insert(close_paren, new_layer)]);
 
-    // Find close of the layers block
-    let layers_block = &content[layers_pos..];
-    let close_rel = layers_block
-        .find("\n  )")
-        .or_else(|| layers_block.find(')'))
-        .unwrap_or(layers_block.len().saturating_sub(1));
-    let insert_pos = layers_pos + close_rel;
+    // Never hand KiCAD a board this tool has just broken: re-read the layer
+    // table out of the edited text and check it is still a flat, unique set.
+    if let Err(why) = validate_layer_table(&new_content) {
+        return Ok(CallToolResult::error(format!(
+            "Internal error: the edit would have corrupted '{}' ({why}) — \
+             nothing was written.",
+            board_path.display()
+        )));
+    }
 
-    let new_layer = format!("\n    ({new_id} \"{layer_name}\" {layer_type})");
-    let new_content = apply_edits(content, vec![SexpEdit::insert(insert_pos, new_layer)]);
     write_atomic(&board_path, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
         "added_layer": layer_name, "id": new_id, "type": layer_type
     })))
+}
+
+/// Byte offset of the board's top-level `(layers` — skipping the `(layers ...)`
+/// lists that footprints, pads, and zones carry.
+fn find_layers_block(content: &str) -> Option<usize> {
+    let b = content.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                // Skip quoted strings, honouring backslash escapes.
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'(' => {
+                // The board's layer table is a direct child of (kicad_pcb ...).
+                if depth == 1 && b[i..].starts_with(b"(layers") {
+                    return Some(i);
+                }
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The leading whitespace KiCAD uses for the rows inside the layers block, so
+/// an inserted row lines up with the existing ones (KiCAD 10 writes tabs).
+fn row_indent(content: &str, layers_pos: usize) -> String {
+    content[layers_pos..]
+        .lines()
+        .nth(1)
+        .map(|l| l.chars().take_while(|c| c.is_whitespace()).collect())
+        .unwrap_or_else(|| "\t\t".to_string())
+}
+
+/// Check the edited board still has a well-formed layer table: every row a flat
+/// list of scalars, with unique ids and unique names.
+fn validate_layer_table(content: &str) -> Result<(), String> {
+    let tree = parse_sexp(content).map_err(|e| format!("board no longer parses: {e}"))?;
+    let node = tree.find("layers").ok_or("the (layers) section vanished")?;
+    let rows = node.children().ok_or("(layers) is not a list")?;
+
+    let mut ids = std::collections::HashSet::new();
+    let mut names = std::collections::HashSet::new();
+    for row in rows.iter().skip(1) {
+        let c = row.children().ok_or("a layer row is not a list")?;
+        // A row is `(ID "Name" type ["Alias"])` — all scalars. A nested list
+        // means an insert landed inside another row.
+        if c.iter().any(|n| n.children().is_some()) {
+            return Err("a layer row contains a nested list".into());
+        }
+        let id = c
+            .first()
+            .and_then(|n| n.as_str())
+            .ok_or("a layer row has no id")?;
+        let name = c
+            .get(1)
+            .and_then(|n| n.as_str())
+            .ok_or("a layer row has no name")?;
+        if !ids.insert(id.to_string()) {
+            return Err(format!("duplicate layer id {id}"));
+        }
+        if !names.insert(name.to_string()) {
+            return Err(format!("duplicate layer name {name}"));
+        }
+    }
+    Ok(())
 }
 
 async fn handle_set_active_layer(

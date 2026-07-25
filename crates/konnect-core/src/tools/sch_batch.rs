@@ -2,21 +2,32 @@
 //!
 //! **Critical invariant**: every write handler performs a single file read,
 //! collects ALL mutations as `SexpEdit` values against the original content,
-//! then calls `write_atomic` exactly once. This fixes the Python bug where
-//! `batch_connect_to_net` did N separate read/write cycles.
+//! then writes *at most* once — skipping the write entirely when nothing
+//! matched, so a batch of typos cannot pass itself off as a successful edit.
+//! This fixes the Python bug where `batch_connect_to_net` did N separate
+//! read/write cycles.
+//!
+//! That write goes through `write_atomic_checked`, not `write_atomic`: these
+//! handlers splice raw text at computed byte offsets, so the result is
+//! re-parsed and the call fails rather than leaving behind a file KiCAD
+//! cannot open.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_symbol_instance_block, get_path, opt_str, require_f64, require_str, ToolDef,
+    find_symbol_instance_block, get_path, opt_str, rename_symbol_edits, require_f64, require_str,
+    ToolDef,
 };
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, snap_point},
     schematic::{
-        extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires,
+        extract_labels, extract_lib_pins_resolved, extract_symbol_instances, extract_wires,
         format_net_label, format_wire, pin_endpoint, read_schematic,
     },
-    writer::{apply_edits, find_block_with_leading_whitespace, new_uuid, write_atomic, SexpEdit},
+    writer::{
+        apply_edits, find_block_with_leading_whitespace, find_top_level_item, new_uuid,
+        write_atomic_checked, SexpEdit,
+    },
 };
 use serde_json::json;
 
@@ -97,19 +108,25 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "batch_edit_schematic_components",
-            "Apply field updates (Value, Footprint, custom properties) to multiple components \
-             in a single atomic file write.",
+            "Apply field updates (Value, Footprint, custom properties) and reference-designator \
+             renames to multiple components in a single atomic file write.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
                     "edits": {
                         "type": "array",
-                        "description": "List of {reference, value?, footprint?, fields?} edit objects",
+                        "description": "List of {reference, new_reference?, value?, footprint?, fields?} edit objects",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "reference": { "type": "string" },
+                                "new_reference": {
+                                    "type": "string",
+                                    "description": "New reference designator (updates both the \
+                                                    Reference property and the instances entry \
+                                                    that PCB sync reads)"
+                                },
                                 "value": { "type": "string" },
                                 "footprint": { "type": "string" },
                                 "fields": {
@@ -318,7 +335,9 @@ async fn handle_batch_connect_to_net(
             .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
 
         let pin_ep = lib_sym.and_then(|sym| {
-            extract_lib_pins(sym)
+            // `_resolved` walks `(extends "Parent")`: derived symbols carry
+            // no pins themselves, so the label landed nowhere for them.
+            extract_lib_pins_resolved(sym, &lib_syms)
                 .into_iter()
                 .find(|p| p.number == pin_number)
                 .map(|p| pin_endpoint(&p, inst.pin_transform()))
@@ -342,7 +361,10 @@ async fn handle_batch_connect_to_net(
         let close_pos = content.rfind(')').unwrap_or(content.len());
         let edits = vec![SexpEdit::insert(close_pos, inserts)];
         let new_content = apply_edits(content, edits);
-        write_atomic(&sch_path, &new_content)?;
+        // Checked: the label text is spliced in at a computed byte offset, so a
+        // bad offset must fail the call rather than leave behind a file KiCAD
+        // cannot open.
+        write_atomic_checked(&sch_path, &new_content, "kicad_sch")?;
     }
 
     Ok(CallToolResult::json(&json!({
@@ -374,19 +396,16 @@ async fn handle_batch_delete(
             let pattern = format!(r#"(uuid "{}")"#, uuid);
             match content.find(&pattern) {
                 Some(uuid_pos) => {
-                    let before = &content[..uuid_pos];
-                    // Top-level schematic items are at 2-space indent: "\n  ("
-                    match before.rfind("\n  (").map(|p| p + 1) {
-                        Some(block_start) => {
-                            match find_block_with_leading_whitespace(&content, block_start) {
-                                Some((del_start, del_end)) => {
-                                    edits.push(SexpEdit::delete(del_start, del_end));
-                                    deleted.push(uuid.to_string());
-                                }
-                                None => {
-                                    errors.push(format!("Cannot parse block for UUID '{}'", uuid))
-                                }
-                            }
+                    // Indentation-agnostic: this used to walk back to a literal
+                    // "\n  (", which finds nothing in the tab-indented files
+                    // eeschema writes, so deleting by UUID failed outright on
+                    // every real KiCAD schematic.
+                    match find_top_level_item(&content, uuid_pos)
+                        .and_then(|(start, _)| find_block_with_leading_whitespace(&content, start))
+                    {
+                        Some((del_start, del_end)) => {
+                            edits.push(SexpEdit::delete(del_start, del_end));
+                            deleted.push(uuid.to_string());
                         }
                         None => errors.push(format!("Cannot locate block for UUID '{}'", uuid)),
                     }
@@ -413,8 +432,15 @@ async fn handle_batch_delete(
         }
     }
 
-    let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    // Nothing matched: rewriting the file with identical content would bump its
+    // mtime and present a no-op as a successful delete.
+    if !edits.is_empty() {
+        let new_content = apply_edits(content, edits);
+        // Checked: whole blocks are cut out at computed byte offsets, so an
+        // off-by-one that unbalances the parens must fail the call rather than
+        // replace the user's file with one KiCAD cannot open.
+        write_atomic_checked(&sch_path, &new_content, "kicad_sch")?;
+    }
 
     Ok(CallToolResult::json(&json!({
         "deleted_count": deleted.len(),
@@ -500,8 +526,15 @@ async fn handle_bulk_move(
         }));
     }
 
-    let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    // Nothing matched: rewriting the file with identical content would bump its
+    // mtime and present a no-op as a successful move.
+    if !edits.is_empty() {
+        let new_content = apply_edits(content, edits);
+        // Checked: these are raw string splices, so a mis-computed offset must
+        // fail the call rather than replace the user's file with one KiCAD
+        // cannot open.
+        write_atomic_checked(&sch_path, &new_content, "kicad_sch")?;
+    }
 
     Ok(CallToolResult::json(&json!({
         "moved_count": moved.len(),
@@ -537,6 +570,35 @@ async fn handle_batch_edit(
 
         let mut component_changes: Vec<String> = Vec::new();
 
+        // A designator is stored twice — in the `Reference` property and in the
+        // `(instances … (reference "…"))` entry that "Update PCB from
+        // Schematic" reads — so it can never go through the single-property
+        // field path, however the caller spells the request.
+        let new_ref = edit_spec["new_reference"]
+            .as_str()
+            .or_else(|| edit_spec["fields"]["Reference"].as_str());
+        if let Some(new_ref) = new_ref {
+            match rename_symbol_edits(&content, reference, new_ref) {
+                Ok((rename_edits, outcome)) => {
+                    file_edits.extend(rename_edits);
+                    component_changes.push(format!("Reference → {}", new_ref));
+                    if outcome.instances > 0 {
+                        component_changes.push(format!(
+                            "instances reference → {} ({})",
+                            new_ref, outcome.instances
+                        ));
+                    } else {
+                        errors.push(format!(
+                            "instances: '{}' has no (instances …) entry, so \
+                             'Update PCB from Schematic' will not see the new name",
+                            reference
+                        ));
+                    }
+                }
+                Err(why) => errors.push(format!("Reference on '{}': {}", reference, why)),
+            }
+        }
+
         // Standard fields
         for (field, key) in &[("Value", "value"), ("Footprint", "footprint")] {
             if let Some(new_val) = edit_spec[key].as_str() {
@@ -553,6 +615,10 @@ async fn handle_batch_edit(
         // Arbitrary extra fields from "fields" object
         if let Some(fields_obj) = edit_spec["fields"].as_object() {
             for (field_name, field_val) in fields_obj {
+                // Already renamed above, in both of its homes.
+                if field_name == "Reference" {
+                    continue;
+                }
                 if let Some(new_val) = field_val.as_str() {
                     match field_value_range(&content, reference, field_name) {
                         Some((start, end)) => {
@@ -576,8 +642,15 @@ async fn handle_batch_edit(
         }
     }
 
-    let new_content = apply_edits(content, file_edits);
-    write_atomic(&sch_path, &new_content)?;
+    // Nothing matched: rewriting the file with identical content would bump its
+    // mtime and, worse, present a no-op as a successful edit.
+    if !file_edits.is_empty() {
+        let new_content = apply_edits(content, file_edits);
+        // Checked: these are raw string splices, so a mis-computed offset must
+        // fail the call rather than replace the user's file with one KiCAD
+        // cannot open.
+        write_atomic_checked(&sch_path, &new_content, "kicad_sch")?;
+    }
 
     Ok(CallToolResult::json(&json!({
         "updated_count": changed.len(),
@@ -615,8 +688,15 @@ async fn handle_batch_delete_components(
         }
     }
 
-    let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    // Nothing matched: rewriting the file with identical content would bump its
+    // mtime and present a no-op as a successful delete.
+    if !edits.is_empty() {
+        let new_content = apply_edits(content, edits);
+        // Checked: whole blocks are cut out at computed byte offsets, so an
+        // off-by-one that unbalances the parens must fail the call rather than
+        // replace the user's file with one KiCAD cannot open.
+        write_atomic_checked(&sch_path, &new_content, "kicad_sch")?;
+    }
 
     Ok(CallToolResult::json(&json!({
         "deleted_count": deleted.len(),
@@ -663,7 +743,9 @@ async fn handle_connect_passthrough(
         format!("{wire_sexp}{label_sexp}"),
     )];
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    // Always exactly one insert, so there is no empty-batch case to guard —
+    // but the splice lands at a computed offset, so it still gets re-parsed.
+    write_atomic_checked(&sch_path, &new_content, "kicad_sch")?;
 
     Ok(CallToolResult::json(&json!({
         "net": net_name,
@@ -707,7 +789,10 @@ async fn handle_add_schematic_text(
     let close_pos = content.rfind(')').unwrap_or(content.len());
     let edits = vec![SexpEdit::insert(close_pos, text_sexp)];
     let new_content = apply_edits(content, edits);
-    write_atomic(&sch_path, &new_content)?;
+    // Always exactly one insert, so there is no empty-batch case to guard —
+    // but the text is user-supplied and spliced at a computed offset, so it
+    // still gets re-parsed.
+    write_atomic_checked(&sch_path, &new_content, "kicad_sch")?;
 
     Ok(CallToolResult::json(&json!({
         "added": text,
@@ -812,7 +897,7 @@ async fn handle_validate_wire_connections(
             .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
-            for pin in extract_lib_pins(sym) {
+            for pin in extract_lib_pins_resolved(sym, &lib_syms) {
                 pin_points.push(pin_endpoint(&pin, t));
             }
         }
@@ -945,7 +1030,7 @@ async fn handle_validate_component_connections(
             .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id));
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
-            for pin in extract_lib_pins(sym) {
+            for pin in extract_lib_pins_resolved(sym, &lib_syms) {
                 let (px, py) = pin_endpoint(&pin, t);
 
                 // Skip intentional no-connects
@@ -975,4 +1060,400 @@ async fn handle_validate_component_connections(
         "unconnected_count": unconnected.len(),
         "unconnected_pins": unconnected
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// TAB-indented, the way eeschema/KiCAD 10 writes files — this crate's own
+    /// writer uses two spaces, and every matcher has to cope with both.
+    fn tab_indented_sch(path: &std::path::Path) {
+        std::fs::write(
+            path,
+            "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"11111111-2222-3333-4444-555555555555\")\n\t(lib_symbols\n\t\t(symbol \"Device:R\"\n\t\t\t(property \"Reference\" \"R\"\n\t\t\t\t(at 0 0 0)\n\t\t\t)\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 100 80 0)\n\t\t(unit 1)\n\t\t(exclude_from_sim no)\n\t\t(uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 102 78 0)\n\t\t)\n\t\t(property \"Value\" \"10k\"\n\t\t\t(at 102 82 0)\n\t\t)\n\t\t(instances\n\t\t\t(project \"tabs\"\n\t\t\t\t(path \"/11111111-2222-3333-4444-555555555555\"\n\t\t\t\t\t(reference \"R1\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n)\n",
+        )
+        .unwrap();
+    }
+
+    /// A designator lives in the `Reference` property *and* in the instances
+    /// entry, and it is the instance entry that "Update PCB from Schematic"
+    /// reads. Routing `fields: {"Reference": …}` through the plain property
+    /// writer left the file self-inconsistent and PCB sync failing on the old
+    /// designator.
+    #[tokio::test]
+    async fn batch_rename_via_fields_updates_property_and_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.kicad_sch");
+        tab_indented_sch(&path);
+        let ctx = test_ctx();
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{
+                    "reference": "R1",
+                    "fields": { "Reference": "R42" },
+                    "value": "22k"
+                }]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "batch edit failed: {:?}", result.content);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(r#"(property "Reference" "R42""#),
+            "Reference property not renamed:\n{text}"
+        );
+        assert!(
+            text.contains(r#"(reference "R42")"#),
+            "instances (reference …) not renamed — PCB sync reads this one:\n{text}"
+        );
+        assert!(!text.contains("\"R1\""), "old designator remains:\n{text}");
+        // Other fields in the same spec still land, and the lib_symbols
+        // definition's own Reference is untouched.
+        assert!(text.contains(r#"(property "Value" "22k""#), "{text}");
+        assert!(text.contains(r#"(property "Reference" "R""#), "{text}");
+        // Raw-text editing must not drop nodes the typed model doesn't know.
+        assert!(
+            text.contains("(exclude_from_sim no)"),
+            "editing dropped an unmodelled node:\n{text}"
+        );
+    }
+
+    /// The explicit key does the same thing as `fields: {"Reference": …}`.
+    #[tokio::test]
+    async fn batch_rename_via_new_reference_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.kicad_sch");
+        tab_indented_sch(&path);
+        let ctx = test_ctx();
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{ "reference": "R1", "new_reference": "R7" }]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#"(property "Reference" "R7""#), "{text}");
+        assert!(text.contains(r#"(reference "R7")"#), "{text}");
+    }
+
+    /// Multi-unit parts repeat the designator across one `(symbol …)` block per
+    /// unit. Every unit's *both* copies must move, and since the batch handler
+    /// collects offsets against the original content, the second unit's edits
+    /// must not be computed against text the first unit's edits shifted.
+    #[tokio::test]
+    async fn batch_rename_covers_every_unit_of_a_multi_unit_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.kicad_sch");
+        let unit = |n: u32, y: u32| {
+            format!("\t(symbol\n\t\t(lib_id \"Amp:LM358\")\n\t\t(at 100 {y} 0)\n\t\t(unit {n})\n\t\t(uuid \"unit-{n}\")\n\t\t(property \"Reference\" \"U1\"\n\t\t\t(at 102 78 0)\n\t\t)\n\t\t(property \"Value\" \"LM358\"\n\t\t\t(at 102 82 0)\n\t\t)\n\t\t(instances\n\t\t\t(project \"multi\"\n\t\t\t\t(path \"/root-uuid\"\n\t\t\t\t\t(reference \"U1\")\n\t\t\t\t\t(unit {n})\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n")
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n\t(version 20250610)\n\t(uuid \"root-uuid\")\n{}{})\n",
+                unit(1, 80),
+                unit(2, 100)
+            ),
+        )
+        .unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{ "reference": "U1", "fields": { "Reference": "U9" } }]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"U1\""), "a unit was left behind:\n{text}");
+        assert_eq!(
+            text.matches(r#"(property "Reference" "U9""#).count(),
+            2,
+            "both units' properties must be renamed:\n{text}"
+        );
+        assert_eq!(
+            text.matches(r#"(reference "U9")"#).count(),
+            2,
+            "both units' instance entries must be renamed:\n{text}"
+        );
+    }
+
+    /// An edit that matched nothing must not rewrite the file: the old handler
+    /// wrote unconditionally, so a batch of typos still bumped the file's mtime
+    /// while reporting `updated_count: 0`.
+    #[tokio::test]
+    async fn batch_edit_that_matches_nothing_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.kicad_sch");
+        tab_indented_sch(&path);
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path.display().to_string(),
+                "edits": [{ "reference": "R99", "value": "1k" }]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "a no-op batch must not touch the file"
+        );
+    }
+
+    /// Same contract for the sibling handlers: a batch that matched nothing
+    /// reports its errors and leaves the file untouched.
+    #[tokio::test]
+    async fn bulk_move_that_matches_nothing_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.kicad_sch");
+        tab_indented_sch(&path);
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_bulk_move(
+            &json!({
+                "schematic": path.display().to_string(),
+                "references": ["R99"],
+                "dx": 2.54,
+                "dy": 0.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "a no-op bulk move must not touch the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_delete_components_that_matches_nothing_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.kicad_sch");
+        tab_indented_sch(&path);
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_batch_delete_components(
+            &json!({
+                "schematic": path.display().to_string(),
+                "references": ["R99"]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "a no-op delete must not touch the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_connect_to_net_that_matches_nothing_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.kicad_sch");
+        tab_indented_sch(&path);
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_batch_connect_to_net(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net_name": "VCC",
+                "pins": [{ "reference": "R99", "pin_number": "1" }]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "a no-op net connect must not touch the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_delete_that_matches_nothing_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.kicad_sch");
+        tab_indented_sch(&path);
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let ctx = test_ctx();
+
+        let result = handle_batch_delete(
+            &json!({
+                "schematic": path.display().to_string(),
+                "references": ["R99"],
+                "uuids": ["00000000-0000-0000-0000-000000000000"]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "a no-op delete must not touch the file"
+        );
+    }
+
+    /// Deleting by UUID used to walk back to a literal `"\n  ("`, so it found
+    /// nothing in the tab-indented files eeschema actually writes — the whole
+    /// by-UUID branch failed on every real KiCAD schematic. Both indentation
+    /// styles must work.
+    #[tokio::test]
+    async fn batch_delete_by_uuid_works_on_either_indentation() {
+        for style in ["tabs", "spaces"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("d.kicad_sch");
+            tab_indented_sch(&path);
+            if style == "spaces" {
+                let tabbed = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(&path, tabbed.replace('\t', "  ")).unwrap();
+            }
+            let ctx = test_ctx();
+
+            let result = handle_batch_delete(
+                &json!({
+                    "schematic": path.display().to_string(),
+                    "uuids": ["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error, "{style}: {:?}", result.content);
+
+            let text = std::fs::read_to_string(&path).unwrap();
+            read_schematic(&path)
+                .unwrap_or_else(|e| panic!("{style}: output does not parse: {e}\n{text}"));
+            // The whole symbol block went, not just the (uuid …) line.
+            assert!(
+                !text.contains(r#"(property "Reference" "R1""#),
+                "{style}: symbol block survived:\n{text}"
+            );
+            assert!(
+                !text.contains("aaaaaaaa-bbbb"),
+                "{style}: uuid survived:\n{text}"
+            );
+            // Neighbouring top-level items must be untouched.
+            assert!(
+                text.contains("(lib_symbols"),
+                "{style}: took out a sibling block:\n{text}"
+            );
+            assert!(
+                text.contains(r#"(property "Reference" "R""#),
+                "{style}: lib_symbols contents damaged:\n{text}"
+            );
+        }
+    }
+
+    /// `connect_passthrough` and `add_schematic_text` always insert exactly one
+    /// block, so they have no empty-batch case — what the checked write buys
+    /// them is that the splice cannot leave behind an unparseable file.
+    #[tokio::test]
+    async fn connect_passthrough_output_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.kicad_sch");
+        tab_indented_sch(&path);
+        let ctx = test_ctx();
+
+        let result = handle_connect_passthrough(
+            &json!({
+                "schematic": path.display().to_string(),
+                "net_name": "VCC",
+                "x": 100.0, "y": 80.0,
+                "direction": "right"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        read_schematic(&path).unwrap_or_else(|e| panic!("output does not parse: {e}\n{text}"));
+        assert!(text.contains(r#""VCC""#), "{text}");
+        // The pre-existing symbol must survive the splice.
+        assert!(text.contains(r#"(property "Reference" "R1""#), "{text}");
+    }
+
+    #[tokio::test]
+    async fn add_schematic_text_output_still_parses_with_quotes_in_the_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.kicad_sch");
+        tab_indented_sch(&path);
+        let ctx = test_ctx();
+
+        // Quotes and backslashes in user text are the way this splice would
+        // most plausibly produce an unbalanced document.
+        let result = handle_add_schematic_text(
+            &json!({
+                "schematic": path.display().to_string(),
+                "text": r#"say "hi" \ (not a block)"#,
+                "x": 50.0, "y": 50.0
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        read_schematic(&path).unwrap_or_else(|e| panic!("output does not parse: {e}\n{text}"));
+        assert!(text.contains(r#"(property "Reference" "R1""#), "{text}");
+    }
 }

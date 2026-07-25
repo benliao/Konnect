@@ -13,12 +13,12 @@ use konnect_sexp::{
     geometry::snap_point,
     parser::parse_sexp,
     schematic::{
-        extract_lib_pins, extract_symbol_instances, extract_wires, find_t_junctions,
+        extract_lib_pins_resolved, extract_symbol_instances, extract_wires, find_t_junctions,
         format_junction, format_wire, parse_at, pin_endpoint, read_schematic,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
-        write_atomic, SexpEdit,
+        find_enclosing_block, write_atomic, SexpEdit,
     },
 };
 use serde_json::json;
@@ -542,16 +542,30 @@ async fn handle_delete_wire(
         None => return Ok(CallToolResult::error("Wire not found")),
     };
 
-    // Walk back to the (wire ...) block start
-    let before = &content[..wire_offset];
-    let wire_start = before.rfind("\n  (wire").map(|p| p + 1).unwrap_or(0);
-    let (del_start, del_end) = match find_block_with_leading_whitespace(&content, wire_start) {
+    // Find the (wire ...) block enclosing the match. This MUST be the
+    // indentation-agnostic search: `rfind("\n  (wire")` misses on every
+    // eeschema-saved file (KiCAD indents with tabs), fell back to offset 0,
+    // and then deleted the whole top-level (kicad_sch ...) block — i.e. it
+    // emptied the schematic and reported "Wire deleted."
+    let (block_start, _) = match find_enclosing_block(&content, "wire", wire_offset) {
+        Some(r) => r,
+        None => return Ok(CallToolResult::error("Cannot parse wire block")),
+    };
+    let (del_start, del_end) = match find_block_with_leading_whitespace(&content, block_start) {
         Some(r) => r,
         None => return Ok(CallToolResult::error("Cannot parse wire block")),
     };
 
     let edits = vec![SexpEdit::delete(del_start, del_end)];
     let new_content = apply_edits(content, edits);
+    // Round-trip the edit before it replaces the user's file.
+    if let Err(why) = konnect_sexp::writer::check_document(&new_content, "kicad_sch") {
+        return Ok(CallToolResult::error(format!(
+            "Internal error: deleting the wire would have corrupted '{}' ({why}) — \
+             nothing was written.",
+            sch_path.display()
+        )));
+    }
     write_atomic(&sch_path, &new_content)?;
     Ok(CallToolResult::text("Wire deleted."))
 }
@@ -1365,7 +1379,10 @@ fn resolve_pin_endpoint(
         .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
         .ok_or_else(|| anyhow::anyhow!("Library symbol '{}' not found", inst.lib_id))?;
 
-    let pins = extract_lib_pins(lib_sym);
+    // `_resolved` follows `(extends "Parent")`: derived KiCAD parts such as
+    // Transistor_FET:2N7002 carry no pins of their own, so a plain scan made
+    // connect_pins fail with "Pin 'N' not found" for every such component.
+    let pins = extract_lib_pins_resolved(lib_sym, lib_syms);
     let lib_pin = pins
         .iter()
         .find(|p| p.number == pin_number)
@@ -1661,5 +1678,196 @@ mod label_tests {
         let (_d, path) = sch_with(TWO_PLAIN);
         let result = rotate(&path, "VCC", 555.0, 555.0, 180.0).await;
         assert!(result.is_error, "must not rotate the nearest label instead");
+    }
+}
+
+#[cfg(test)]
+mod delete_wire_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// eeschema indents with TABS. The old `rfind("\n  (wire")` missed, fell
+    /// back to offset 0, and deleted the whole `(kicad_sch ...)` block —
+    /// emptying the file while reporting "Wire deleted."
+    #[tokio::test]
+    async fn deletes_only_the_wire_in_a_tab_indented_schematic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.kicad_sch");
+        let original = "(kicad_sch\n\
+             \t(version 20250610)\n\
+             \t(generator \"eeschema\")\n\
+             \t(uuid \"11111111-1111-1111-1111-111111111111\")\n\
+             \t(wire\n\
+             \t\t(pts (xy 0 0) (xy 10 0))\n\
+             \t\t(uuid \"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\")\n\
+             \t)\n\
+             \t(wire\n\
+             \t\t(pts (xy 0 10) (xy 10 10))\n\
+             \t\t(uuid \"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\")\n\
+             \t)\n\
+             )\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = handle_delete_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "delete should succeed");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.starts_with("(kicad_sch"),
+            "schematic was emptied: {after:?}"
+        );
+        assert!(
+            !after.contains("aaaaaaaa-aaaa"),
+            "target wire survived: {after}"
+        );
+        assert!(
+            after.contains("bbbbbbbb-bbbb"),
+            "the OTHER wire was destroyed: {after}"
+        );
+        assert!(after.contains("(version 20250610)"), "header lost: {after}");
+    }
+}
+
+#[cfg(test)]
+mod derived_symbol_wiring_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// TAB indentation, as KiCAD 10 writes it (this crate's writer uses two
+    /// spaces — both have to work). Q1/Q2 are `Transistor_FET:2N7002`, a real
+    /// derived symbol with no pins of its own; G/S/D live on the sibling
+    /// `Q_NMOS_GSD` entry reached through `(extends …)`.
+    const TWO_DERIVED_FETS: &str = "(kicad_sch\n\
+\t(version 20250114)\n\
+\t(generator \"eeschema\")\n\
+\t(uuid \"7c9e2a10-3b4d-4e5f-8a9b-0c1d2e3f4a5b\")\n\
+\t(paper \"A4\")\n\
+\t(lib_symbols\n\
+\t\t(symbol \"Transistor_FET:Q_NMOS_GSD\"\n\
+\t\t\t(symbol \"Q_NMOS_GSD_0_1\"\n\
+\t\t\t\t(pin input line\n\
+\t\t\t\t\t(at -5.08 0 0)\n\
+\t\t\t\t\t(length 2.54)\n\
+\t\t\t\t\t(name \"G\")\n\
+\t\t\t\t\t(number \"1\")\n\
+\t\t\t\t)\n\
+\t\t\t\t(pin passive line\n\
+\t\t\t\t\t(at 0 -5.08 90)\n\
+\t\t\t\t\t(length 2.54)\n\
+\t\t\t\t\t(name \"S\")\n\
+\t\t\t\t\t(number \"2\")\n\
+\t\t\t\t)\n\
+\t\t\t\t(pin passive line\n\
+\t\t\t\t\t(at 0 5.08 270)\n\
+\t\t\t\t\t(length 2.54)\n\
+\t\t\t\t\t(name \"D\")\n\
+\t\t\t\t\t(number \"3\")\n\
+\t\t\t\t)\n\
+\t\t\t)\n\
+\t\t)\n\
+\t\t(symbol \"Transistor_FET:2N7002\"\n\
+\t\t\t(extends \"Transistor_FET:Q_NMOS_GSD\")\n\
+\t\t\t(property \"Reference\" \"Q\"\n\
+\t\t\t\t(at 5.08 1.905 0)\n\
+\t\t\t)\n\
+\t\t)\n\
+\t)\n\
+\t(symbol\n\
+\t\t(lib_id \"Transistor_FET:2N7002\")\n\
+\t\t(at 100 100 0)\n\
+\t\t(unit 1)\n\
+\t\t(uuid \"aaaaaaaa-1111-2222-3333-444444444444\")\n\
+\t\t(property \"Reference\" \"Q1\"\n\
+\t\t\t(at 105.08 98 0)\n\
+\t\t)\n\
+\t\t(property \"Value\" \"2N7002\"\n\
+\t\t\t(at 105.08 100 0)\n\
+\t\t)\n\
+\t)\n\
+\t(symbol\n\
+\t\t(lib_id \"Transistor_FET:2N7002\")\n\
+\t\t(at 140 100 0)\n\
+\t\t(unit 1)\n\
+\t\t(uuid \"bbbbbbbb-1111-2222-3333-444444444444\")\n\
+\t\t(property \"Reference\" \"Q2\"\n\
+\t\t\t(at 145.08 98 0)\n\
+\t\t)\n\
+\t\t(property \"Value\" \"2N7002\"\n\
+\t\t\t(at 145.08 100 0)\n\
+\t\t)\n\
+\t)\n\
+)\n";
+
+    #[tokio::test]
+    async fn connect_pins_reaches_pins_inherited_through_extends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fets.kicad_sch");
+        std::fs::write(&path, TWO_DERIVED_FETS).unwrap();
+
+        let result = handle_connect_pins(
+            &json!({
+                "schematic": path.display().to_string(),
+                "ref1": "Q1", "pin1": "1",
+                "ref2": "Q2", "pin2": "1"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !result.is_error,
+            "connect_pins used to fail with \"Pin '1' not found on 'Q1'\" for \
+             every derived symbol: {:?}",
+            result.content
+        );
+
+        // Q1 gate is at (94.92, 100), Q2 gate at (134.92, 100) — same Y, so a
+        // single straight wire is written between the two resolved endpoints.
+        let after = std::fs::read_to_string(&path).unwrap();
+        let tree = konnect_sexp::parser::parse_sexp(&after).unwrap();
+        let wires = extract_wires(&tree);
+        assert_eq!(wires.len(), 1, "expected one wire, got {wires:?}");
+        let w = &wires[0];
+        assert!((w.x1 - 94.92).abs() < 1e-6, "wire start x: {w:?}");
+        assert!((w.x2 - 134.92).abs() < 1e-6, "wire end x: {w:?}");
+        assert!((w.y1 - 100.0).abs() < 1e-6 && (w.y2 - 100.0).abs() < 1e-6);
     }
 }
