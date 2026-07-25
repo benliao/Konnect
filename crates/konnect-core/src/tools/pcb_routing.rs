@@ -369,6 +369,22 @@ async fn handle_route_pad_to_pad(
     let layer = args["layer"].as_str().unwrap_or("F.Cu").to_string();
     let width = args["width"].as_f64().unwrap_or(0.25);
 
+    // Pad geometry is read from `board_path` but the tracks are created over
+    // IPC, which lands on whatever board KiCAD has open. Without this gate the
+    // tool reads coordinates out of one file and routes them onto a different
+    // board. There is no file fallback for track creation here, so refuse.
+    if !crate::tools::pcb_board::ipc_targets_board(ctx.config.ipc_address.clone(), &board_path)
+        .await
+    {
+        return Ok(CallToolResult::error(format!(
+            "route_pad_to_pad creates tracks through KiCAD's IPC API, which acts on \
+             the board KiCAD currently has open — and that is not '{}'. Open exactly \
+             that file in KiCAD and retry; routing now would read pad positions from \
+             the named file and write the tracks onto a different board.",
+            board_path.display()
+        )));
+    }
+
     // Look up pad positions from the PCB S-expression file
     let content = std::fs::read_to_string(&board_path)?;
     let tree = konnect_sexp::parser::parse_sexp(&content)?;
