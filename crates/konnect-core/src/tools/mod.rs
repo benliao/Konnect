@@ -844,3 +844,104 @@ mod net_ref_tests {
         assert!(resolve_net(c, "GND_ANALOG").is_some());
     }
 }
+
+// ─── Board file writes, synchronised with a running KiCAD ────────────────────
+
+use serde_json::json;
+
+/// What happened to KiCAD's view of the board around a file write.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoardSync {
+    /// KiCAD is not running, or has a different board open. Nothing to do.
+    NotOpen,
+    /// KiCAD had this board open and was told to reload it from disk.
+    Reloaded,
+    /// KiCAD had this board open but the reload failed; the file on disk is
+    /// correct, the editor is showing something older.
+    ReloadFailed(String),
+}
+
+impl BoardSync {
+    pub fn as_json(&self) -> Value {
+        match self {
+            BoardSync::NotOpen => json!("not_open"),
+            BoardSync::Reloaded => json!("reloaded"),
+            BoardSync::ReloadFailed(e) => json!({ "status": "reload_failed", "error": e }),
+        }
+    }
+
+    /// A note for the caller when the editor may now be stale.
+    pub fn note(&self) -> Option<String> {
+        match self {
+            BoardSync::ReloadFailed(_) => Some(
+                "KiCAD has this board open and could not be reloaded — use File > Revert \
+                 in KiCAD, or its in-memory copy will overwrite this change on save."
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// Write a `.kicad_pcb` and keep a running KiCAD in step with it.
+///
+/// The file is authoritative. IPC is used only to stop the editor from holding
+/// — and later re-saving — a stale copy of a board this tool just changed:
+///
+/// 1. If KiCAD has *this* board open, ask it to save first, so anything the
+///    user changed by hand is on disk and included in what we edit.
+/// 2. Write the file (validated and backed up by `write_atomic_checked`).
+/// 3. Ask KiCAD to revert, so the editor reloads what was written.
+///
+/// When KiCAD is not running, or has a different board open, steps 1 and 3 are
+/// skipped and this is a plain validated write — which is why the tools work
+/// headless.
+pub async fn write_board_synced(
+    ipc_address: &str,
+    path: &std::path::Path,
+    content: &str,
+) -> anyhow::Result<BoardSync> {
+    let open_here = board_sync_before(ipc_address, path).await;
+    konnect_sexp::writer::write_atomic_checked(path, content, "kicad_pcb")?;
+    Ok(board_sync_after(ipc_address, open_here).await)
+}
+
+/// Step 1 of the protocol: if KiCAD has this exact board open, flush its
+/// in-memory edits to disk so they are part of what we are about to change.
+/// Returns whether KiCAD had it open.
+pub async fn board_sync_before(ipc_address: &str, path: &std::path::Path) -> bool {
+    let open_here = crate::tools::pcb_board::ipc_targets_board(ipc_address.to_string(), path).await;
+    if open_here {
+        let addr = ipc_address.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            konnect_ipc::client::KiCadIpcClient::new(&addr).save_board()
+        })
+        .await;
+    }
+    open_here
+}
+
+/// Step 3 of the protocol: make KiCAD reload the file that was just written.
+///
+/// Split out from [`write_board_synced`] so a write performed by something
+/// other than us — `kicad-cli --save-board`, for instance — can still leave the
+/// editor consistent with disk.
+pub async fn board_sync_after(ipc_address: &str, was_open: bool) -> BoardSync {
+    if !was_open {
+        return BoardSync::NotOpen;
+    }
+    let addr = ipc_address.to_string();
+    let reverted = tokio::task::spawn_blocking(move || {
+        let c = konnect_ipc::client::KiCadIpcClient::new(&addr);
+        c.revert_board()?;
+        let _ = c.refresh_editor();
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+
+    match reverted {
+        Ok(Ok(())) => BoardSync::Reloaded,
+        Ok(Err(e)) => BoardSync::ReloadFailed(e.to_string()),
+        Err(e) => BoardSync::ReloadFailed(e.to_string()),
+    }
+}

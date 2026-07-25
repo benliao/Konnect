@@ -477,6 +477,30 @@ impl KiCadIpcClient {
         Ok(())
     }
 
+    /// Reload the open board from disk, discarding KiCAD's in-memory copy.
+    ///
+    /// The other half of the file-authoritative protocol: after a tool edits
+    /// the `.kicad_pcb`, KiCAD is still showing (and would re-save) the stale
+    /// board it loaded earlier. Reverting makes the editor match the file that
+    /// was just written.
+    pub fn revert_board(&self) -> Result<()> {
+        let doc = self.get_board_document()?;
+        let cmd = kiapi::common::commands::RevertDocument {
+            document: Some(doc),
+        };
+        self.send_command(&cmd, "kiapi.common.commands.RevertDocument")?;
+        Ok(())
+    }
+
+    /// Redraw the editor, so a reverted board is visible without interaction.
+    pub fn refresh_editor(&self) -> Result<()> {
+        let cmd = kiapi::common::commands::RefreshEditor {
+            frame: kiapi::common::types::FrameType::FtPcbEditor as i32,
+        };
+        self.send_command(&cmd, "kiapi.common.commands.RefreshEditor")?;
+        Ok(())
+    }
+
     /// Begin a commit (undo group).
     pub fn begin_commit(&self) -> Result<String> {
         let cmd = kiapi::common::commands::BeginCommit {};

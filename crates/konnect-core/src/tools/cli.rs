@@ -163,6 +163,30 @@ fn parse_erc_json(raw: &serde_json::Value) -> Vec<ErcViolation> {
 
 /// Run DRC on a PCB and return parsed violations.
 /// KiCAD 10: `pcb drc --output <path> --format json [--refill-zones] <input>`
+/// Recompute zone fills and write them back into the board.
+///
+/// `--refill-zones` alone computes the fill and throws it away; `--save-board`
+/// is what persists it. This is what makes zone filling work without a running
+/// KiCAD — it was previously reachable only over IPC, i.e. only when the user
+/// happened to have that exact board open.
+pub async fn refill_zones(cli: &str, pcb: &Path) -> Result<()> {
+    let out_path = pcb.with_extension("refill.drc.json");
+    let args = vec![
+        "pcb",
+        "drc",
+        "--refill-zones",
+        "--save-board",
+        "--output",
+        out_path.to_str().unwrap(),
+        "--format",
+        "json",
+        pcb.to_str().unwrap(),
+    ];
+    run_cli(cli, &args, LONG_TIMEOUT).await?;
+    let _ = tokio::fs::remove_file(&out_path).await;
+    Ok(())
+}
+
 pub async fn run_drc(cli: &str, pcb: &Path, refill_zones: bool) -> Result<Vec<DrcViolation>> {
     let out_path = pcb.with_extension("drc.json");
     let mut args = vec![

@@ -8,25 +8,8 @@ use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, ToolContext, ToolDef};
 use serde_json::json;
-use tokio::task;
 
 use super::cli;
-
-// ─── IPC helpers (mirrors pcb_board / pcb_components) ───────────────────────
-
-async fn with_ipc<T, F>(addr: String, f: F) -> anyhow::Result<Result<T, String>>
-where
-    T: Send + 'static,
-    F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
-{
-    let result = task::spawn_blocking(move || {
-        let client = konnect_ipc::client::KiCadIpcClient::new(&addr);
-        f(&client).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {e}"))?;
-    Ok(result)
-}
 
 // ─── Severity filter helpers ──────────────────────────────────────────────────
 
@@ -597,47 +580,48 @@ async fn handle_refill_zones(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
-    let _cli = &ctx.config.kicad_cli;
 
-    // kicad-cli pcb export gerber triggers zone fills as a side-effect,
-    // but the proper command is kicad-cli pcb --refill-zones (not in all versions).
-    // Use IPC refill_zones when available; there is no file-level fallback.
-    //
-    // The IPC command lands on whatever board KiCAD has open, so it may only be
-    // sent once that board is confirmed to be the one named in `board` —
-    // otherwise this silently refills a *different* project's zones and reports
-    // success against the caller's path.
-    if crate::tools::pcb_board::ipc_targets_board(ctx.config.ipc_address.clone(), &board).await {
-        let addr = ctx.config.ipc_address.clone();
-        let result = with_ipc(addr, move |client| {
-            client.refill_zones()?;
-            Ok(())
-        })
-        .await;
-
-        if let Ok(Ok(())) = result {
-            return Ok(CallToolResult::text(
-                serde_json::to_string_pretty(&json!({
-                    "success": true,
-                    "method": "ipc",
-                    "target": board.to_str().unwrap_or(""),
-                    "board": board.to_str().unwrap_or("")
-                }))
-                .unwrap(),
-            ));
-        }
+    // Filled headlessly by kicad-cli, which recomputes the fills and writes
+    // them back. This used to be IPC-only, so refilling was possible only when
+    // the user happened to have that exact board open in KiCAD — and it acted
+    // on whatever board *was* open. Going through the file means the `board`
+    // argument addresses the board it names.
+    if !board.exists() {
+        return Ok(CallToolResult::error(format!(
+            "No board at '{}'.",
+            board.display()
+        )));
     }
 
-    Ok(CallToolResult::text(
-        serde_json::to_string_pretty(&json!({
-            "success": false,
-            "note": "Zone refill requires the board to be open in a running KiCAD instance with \
-                     IPC enabled (KiCAD has no way to refill a board it does not have open). \
-                     Open this exact file in KiCAD, or fill the zones in the KiCAD GUI.",
-            "board": board.to_str().unwrap_or("")
-        }))
-        .unwrap(),
-    ))
+    // kicad-cli rewrites the file itself, so snapshot it here rather than
+    // relying on the write path's own backup.
+    konnect_sexp::backup::backup_before_write(&board);
+
+    let was_open = crate::tools::board_sync_before(&ctx.config.ipc_address, &board).await;
+    cli::refill_zones(&ctx.config.kicad_cli, &board).await?;
+    let sync = crate::tools::board_sync_after(&ctx.config.ipc_address, was_open).await;
+
+    // kicad-cli is KiCAD's own writer, but verify anyway before reporting success.
+    let content = tokio::fs::read_to_string(&board).await?;
+    if let Err(why) = konnect_sexp::writer::check_document(&content, "kicad_pcb") {
+        return Ok(CallToolResult::error(format!(
+            "Zone refill left '{}' unparseable ({why}). A snapshot of the previous \
+             contents is in ~/.konnect/backups/.",
+            board.display()
+        )));
+    }
+
+    let mut out = json!({
+        "success": true,
+        "method": "file",
+        "board": board.to_str().unwrap_or(""),
+        "filled_zones": content.matches("(filled_polygon").count(),
+        "kicad_sync": sync.as_json()
+    });
+    if let Some(note) = sync.note() {
+        out["note"] = json!(note);
+    }
+    Ok(CallToolResult::text(serde_json::to_string_pretty(&out).unwrap()))
 }
 
 async fn handle_get_drc_violations(
