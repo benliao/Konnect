@@ -94,6 +94,10 @@ pub fn apply_edits(mut content: String, mut edits: Vec<SexpEdit>) -> String {
 /// protocol requires that reads immediately after writes see the new data,
 /// so fsync is mandatory.
 pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
+    // Snapshot the current contents first, so a bad edit stays recoverable
+    // without depending on KiCAD's own .history/.
+    crate::backup::backup_before_write(path);
+
     let tmp_path = path.with_extension("kicad_tmp");
 
     {

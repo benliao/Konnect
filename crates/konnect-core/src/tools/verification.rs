@@ -329,6 +329,8 @@ async fn handle_set_design_rules(
 /// Atomic write for the project JSON: temp file -> fsync -> rename.
 fn write_atomic_json(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
     use std::io::Write;
+    konnect_sexp::backup::backup_before_write(path);
+
     let tmp = path.with_extension("kicad_pro.tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;

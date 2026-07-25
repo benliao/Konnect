@@ -691,3 +691,156 @@ pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) -> boo
     }
     true
 }
+
+// ─── Net references in .kicad_pcb ────────────────────────────────────────────
+
+/// How a board refers to a net.
+///
+/// KiCAD changed this between format versions: files up to ~20250513 declare a
+/// numbered table (`(net 1 "GND")`) and reference the number, while 20260206
+/// dropped the table entirely and references nets by name (`(net "GND")`).
+/// Writing the wrong form — or worse, `(net 0)` — produces copper that belongs
+/// to no net: a ground pour that is not connected to ground, which DRC does not
+/// flag because isolated copper is legal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NetRef {
+    /// `(net "GND")` — KiCAD 10's current format.
+    Named(String),
+    /// `(net 1)` + `(net_name "GND")` — the older numbered table.
+    Numbered(i32, String),
+}
+
+impl NetRef {
+    /// The net fields to write inside a `(zone …)`, in this board's format.
+    pub fn zone_fields(&self) -> String {
+        match self {
+            NetRef::Named(name) => format!("(net \"{name}\")"),
+            NetRef::Numbered(id, name) => format!("(net {id}) (net_name \"{name}\")"),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            NetRef::Named(n) | NetRef::Numbered(_, n) => n,
+        }
+    }
+
+    /// The numeric code, where the board still has one.
+    pub fn code(&self) -> Option<i32> {
+        match self {
+            NetRef::Numbered(id, _) => Some(*id),
+            NetRef::Named(_) => None,
+        }
+    }
+}
+
+/// Resolve `net_name` against the nets actually present on `content`.
+///
+/// Returns `None` when the board has no such net. Callers MUST surface that as
+/// an error: the previous behaviour was to fall back to net 0, which writes a
+/// pour connected to nothing and is invisible until the board is fabricated.
+pub fn resolve_net(content: &str, net_name: &str) -> Option<NetRef> {
+    let quoted = format!("\"{net_name}\"");
+
+    // Numbered form first: `(net <digits> "NAME")`.
+    let b = content.as_bytes();
+    for start in konnect_sexp::writer::find_block_starts(content, "net") {
+        let rest = &content[start + "(net".len()..];
+        let trimmed = rest.trim_start();
+        let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        let after = trimmed[digits.len()..].trim_start();
+        if after.starts_with(&quoted) {
+            if let Ok(id) = digits.parse::<i32>() {
+                return Some(NetRef::Numbered(id, net_name.to_string()));
+            }
+        }
+        let _ = b;
+    }
+
+    // Named form: `(net "NAME")`.
+    for start in konnect_sexp::writer::find_block_starts(content, "net") {
+        let rest = &content[start + "(net".len()..];
+        if rest.trim_start().starts_with(&quoted) {
+            return Some(NetRef::Named(net_name.to_string()));
+        }
+    }
+    None
+}
+
+/// The error to return when a caller names a net the board does not have.
+pub fn net_not_found_error(content: &str, net_name: &str) -> CallToolResult {
+    let mut known: Vec<String> = konnect_sexp::writer::find_block_starts(content, "net")
+        .into_iter()
+        .filter_map(|s| {
+            let rest = content[s + "(net".len()..].trim_start();
+            let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit()).trim_start();
+            let inner = rest.strip_prefix('"')?;
+            let end = inner.find('"')?;
+            Some(inner[..end].to_string()).filter(|n| !n.is_empty())
+        })
+        .collect();
+    known.sort();
+    known.dedup();
+    let sample: Vec<&String> = known.iter().take(12).collect();
+
+    CallToolResult::error(format!(
+        "Net '{net_name}' does not exist on this board. Refusing to write a zone \
+         with no net — that produces copper connected to nothing, which DRC does \
+         not flag. Nets on this board: {}{}",
+        sample
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        if known.len() > sample.len() {
+            format!(" … ({} total)", known.len())
+        } else {
+            String::new()
+        }
+    ))
+}
+
+#[cfg(test)]
+mod net_ref_tests {
+    use super::*;
+
+    /// KiCAD 10 (20260206) has no numeric net table at all.
+    const NAMED: &str = "(kicad_pcb\n\t(version 20260206)\n\t(footprint \"x\"\n\t\t(pad \"1\" smd rect\n\t\t\t(net \"GND\")\n\t\t)\n\t\t(pad \"2\" smd rect\n\t\t\t(net \"+3V3\")\n\t\t)\n\t)\n)\n";
+    /// Older boards declare `(net N "NAME")`.
+    const NUMBERED: &str = "(kicad_pcb\n\t(version 20250513)\n\t(net 0 \"\")\n\t(net 1 \"GND\")\n\t(net 2 \"+5V\")\n)\n";
+
+    #[test]
+    fn resolves_named_format() {
+        assert_eq!(
+            resolve_net(NAMED, "GND"),
+            Some(NetRef::Named("GND".into()))
+        );
+        assert_eq!(resolve_net(NAMED, "GND").unwrap().zone_fields(), "(net \"GND\")");
+        assert!(resolve_net(NAMED, "GND").unwrap().code().is_none());
+    }
+
+    #[test]
+    fn resolves_numbered_format() {
+        let n = resolve_net(NUMBERED, "GND").expect("GND is net 1");
+        assert_eq!(n, NetRef::Numbered(1, "GND".into()));
+        assert_eq!(n.zone_fields(), "(net 1) (net_name \"GND\")");
+        assert_eq!(resolve_net(NUMBERED, "+5V").unwrap().code(), Some(2));
+    }
+
+    /// The bug: an unknown net used to become net 0 — a pour joined to nothing.
+    #[test]
+    fn unknown_net_is_none_not_zero() {
+        assert_eq!(resolve_net(NAMED, "VBUS"), None);
+        assert_eq!(resolve_net(NUMBERED, "VBUS"), None);
+    }
+
+    #[test]
+    fn a_net_name_that_is_a_prefix_of_another_does_not_match() {
+        let c = "(kicad_pcb\n\t(pad\n\t\t(net \"GND_ANALOG\")\n\t)\n)\n";
+        assert_eq!(resolve_net(c, "GND"), None, "prefix must not match");
+        assert!(resolve_net(c, "GND_ANALOG").is_some());
+    }
+}

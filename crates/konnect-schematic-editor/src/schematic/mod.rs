@@ -540,6 +540,9 @@ fn dist(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
 /// This ensures the schematic viewer's file-watcher sees a complete file.
 fn atomic_write(path: &Path, content: &str) -> crate::error::Result<()> {
     use std::io::Write;
+    // Snapshot the current contents before replacing them.
+    konnect_sexp::backup::backup_before_write(path);
+
     let tmp_path = path.with_extension("kicad_sch.tmp");
     let mut f = std::fs::File::create(&tmp_path).map_err(crate::error::Error::Io)?;
     f.write_all(content.as_bytes())

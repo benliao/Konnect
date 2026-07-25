@@ -968,7 +968,9 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "tracing",
  "uuid",
 ]
 

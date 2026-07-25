@@ -42,38 +42,26 @@ macro_rules! ipc {
 // ─── S-expression helpers ─────────────────────────────────────────────────────
 
 fn format_zone(
-    net_id: i32,
-    net_name: &str,
+    net: &crate::tools::NetRef,
     layer: &str,
     clearance: f64,
     min_w: f64,
     pts: &[(f64, f64)],
 ) -> String {
     let uuid = new_uuid();
+    let net_fields = net.zone_fields();
     let pt_str: String = pts
         .iter()
         .map(|(x, y)| format!("\n      (xy {x} {y})"))
         .collect();
     format!(
-        "\n  (zone (net {net_id}) (net_name \"{net_name}\") (layer \"{layer}\") (uuid \"{uuid}\")\n    \
+        "\n  (zone {net_fields} (layer \"{layer}\") (uuid \"{uuid}\")\n    \
          (hatch edge 0.508)\n    (connect_pads (clearance {clearance}))\n    \
          (min_thickness {min_w})\n    (fill yes)\n    \
          (polygon (pts{pt_str}\n    ))\n  )"
     )
 }
 
-fn find_net_id(content: &str, net_name: &str) -> i32 {
-    let search = format!(r#" "{net_name}")"#);
-    if let Some(pos) = content.find(&search) {
-        let before = &content[..pos];
-        let net_pos = before.rfind("(net ").unwrap_or(0);
-        let num_str = &before[net_pos + 5..];
-        let num_end = num_str.find(' ').unwrap_or(0);
-        num_str[..num_end].parse().unwrap_or(0)
-    } else {
-        0
-    }
-}
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -288,12 +276,50 @@ async fn handle_add_net(
     };
 
     let content = std::fs::read_to_string(&board_path)?;
-    // Count existing nets to determine next net ID
-    let net_id = content.matches("(net ").count() as i32;
+
+    if let Some(existing) = crate::tools::resolve_net(&content, &net_name) {
+        return Ok(CallToolResult::json(&json!({
+            "net_name": existing.name(), "net_id": existing.code(),
+            "note": "net already exists on this board"
+        })));
+    }
+
+    // The highest declared net id, or None on a board with no numeric net
+    // table. Counting `(net ` occurrences — the old approach — also counted
+    // every pad's net reference, so on a real board the "next id" was ~142.
+    let highest = konnect_sexp::writer::find_block_starts(&content, "net")
+        .into_iter()
+        .filter_map(|s| {
+            let rest = content[s + "(net".len()..].trim_start();
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            (!digits.is_empty() && rest[digits.len()..].trim_start().starts_with('"'))
+                .then(|| digits.parse::<i32>().ok())
+                .flatten()
+        })
+        .max();
+
+    let Some(highest) = highest else {
+        // KiCAD 10 (20260206+) has no net table: nets exist because pads
+        // reference them, so there is nothing to add here. Writing a stray
+        // top-level entry parses but does nothing.
+        return Ok(CallToolResult::error(format!(
+            "This board has no numeric net table — KiCAD 10 derives nets from the \
+             pads that reference them, so '{net_name}' cannot be added as a \
+             standalone entry. Assign the net to a pad (or import the netlist \
+             from the schematic) instead."
+        )));
+    };
+
+    let net_id = highest + 1;
     let net_sexp = format!("\n  (net {net_id} \"{net_name}\")");
-    // Insert before the last closing paren
     let close_pos = content.rfind(')').unwrap_or(content.len());
     let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, net_sexp)]);
+    if let Err(why) = konnect_sexp::writer::check_document(&new_content, "kicad_pcb") {
+        return Ok(CallToolResult::error(format!(
+            "Internal error: adding the net would have corrupted the board ({why}) — \
+             nothing was written."
+        )));
+    }
     write_atomic(&board_path, &new_content)?;
 
     Ok(CallToolResult::json(
@@ -521,8 +547,12 @@ async fn handle_add_copper_pour(
     }
 
     let content = std::fs::read_to_string(&board_path)?;
-    let net_id = find_net_id(&content, &net_name);
-    let zone_s = format_zone(net_id, &net_name, &layer, clearance, min_w, &pts);
+    // Silently falling back to net 0 here produced an isolated pour — copper
+    // that looks like a ground plane but is connected to nothing.
+    let Some(net) = crate::tools::resolve_net(&content, &net_name) else {
+        return Ok(crate::tools::net_not_found_error(&content, &net_name));
+    };
+    let zone_s = format_zone(&net, &layer, clearance, min_w, &pts);
     let close = content.rfind(')').unwrap_or(content.len());
     let new_content = apply_edits(content, vec![SexpEdit::insert(close, zone_s)]);
     write_atomic(&board_path, &new_content)?;

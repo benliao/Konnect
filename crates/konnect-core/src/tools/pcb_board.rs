@@ -356,20 +356,20 @@ fn format_npth_footprint(x: f64, y: f64, drill_d: f64, reference: &str) -> Strin
 }
 
 fn format_zone_polygon(
-    net_id: i32,
-    net_name: &str,
+    net: &crate::tools::NetRef,
     layer: &str,
     clearance: f64,
     min_width: f64,
     points: &[(f64, f64)],
 ) -> String {
     let uuid = new_uuid();
+    let net_fields = net.zone_fields();
     let pts: String = points
         .iter()
         .map(|(x, y)| format!("\n      (xy {x} {y})"))
         .collect();
     format!(
-        "\n  (zone (net {net_id}) (net_name \"{net_name}\") (layer \"{layer}\") (uuid \"{uuid}\")\n    \
+        "\n  (zone {net_fields} (layer \"{layer}\") (uuid \"{uuid}\")\n    \
          (hatch edge 0.508)\n    (connect_pads (clearance {clearance}))\n    \
          (min_thickness {min_width})\n    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))\n    \
          (polygon (pts{pts}\n    ))\n  )"
@@ -391,18 +391,6 @@ fn format_gr_poly(points: &[(f64, f64)], layer: &str) -> String {
     )
 }
 
-/// Find the net ID for a given net name in the .kicad_pcb content.
-fn find_net_id(content: &str, net_name: &str) -> Option<i32> {
-    // Entries look like: (net 1 "GND")
-    let search = format!(r#" "{net_name}")"#);
-    let pos = content.find(&search)?;
-    let before = &content[..pos];
-    // Walk back to find the opening (net and the number
-    let net_pat = before.rfind("(net ")?;
-    let num_start = net_pat + "(net ".len();
-    let num_end = before[num_start..].find(' ').unwrap_or(0);
-    before[num_start..num_start + num_end].parse().ok()
-}
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -1304,17 +1292,29 @@ async fn handle_add_zone(
     }
 
     let content = std::fs::read_to_string(&board_path)?;
-    let net_id = find_net_id(&content, &net_name).unwrap_or(0);
-    let zone_sexp = format_zone_polygon(net_id, &net_name, &layer, clearance, min_width, &points);
+    // An unresolved net used to become net 0: a pour joined to nothing, which
+    // DRC does not flag, so a "GND plane" that isn't connected to GND survives
+    // all the way to fabrication.
+    let Some(net) = crate::tools::resolve_net(&content, &net_name) else {
+        return Ok(crate::tools::net_not_found_error(&content, &net_name));
+    };
+    let zone_sexp = format_zone_polygon(&net, &layer, clearance, min_width, &points);
 
-    let close_pos = content.rfind(')').unwrap_or(content.len());
+    let close_pos = root_close_offset(&content).unwrap_or(content.len());
     let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, zone_sexp)]);
+    if let Err(why) = konnect_sexp::writer::check_document(&new_content, "kicad_pcb") {
+        return Ok(CallToolResult::error(format!(
+            "Internal error: adding the zone would have corrupted '{}' ({why}) — \
+             nothing was written.",
+            board_path.display()
+        )));
+    }
     write_atomic(&board_path, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
-        "net": net_name, "layer": layer,
+        "net": net.name(), "layer": layer,
         "point_count": points.len(),
-        "net_id": net_id
+        "net_id": net.code()
     })))
 }
 
