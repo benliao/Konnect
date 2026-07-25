@@ -13,6 +13,7 @@ use crate::types::*;
 use anyhow::{Context, Result};
 // NNG SetOpt trait is brought in scope automatically by the nng crate's prelude
 use prost::Message;
+use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 /// Converts KiCAD nanometers to millimeters.
@@ -58,6 +59,60 @@ fn pack_any<M: Message>(msg: &M, type_name: &str) -> prost_types::Any {
 /// Decode a prost_types::Any into a specific protobuf message type.
 fn unpack_any<M: Message + Default>(any: &prost_types::Any) -> Result<M> {
     M::decode(any.value.as_slice()).context("Failed to decode protobuf Any body")
+}
+
+// ─── Board identity ──────────────────────────────────────────────────────────
+//
+// KiCAD's IPC API has no "act on this file" addressing: every command targets
+// whichever document the running KiCAD has open. A tool that takes a `board`
+// path and then talks IPC will therefore edit a *different* board than the
+// caller named — silently, and reporting success. Callers must compare the open
+// board's path against the requested one before choosing the IPC path.
+
+/// The full filesystem path of a PCB `DocumentSpecifier`.
+///
+/// KiCAD reports the board as a bare filename (`board_filename`, e.g.
+/// `"board.kicad_pcb"`) plus the project *directory* in `project.path`, so the
+/// full path is the two joined. Returns `None` for documents that are not PCBs
+/// or that carry no filename.
+pub fn document_board_path(doc: &kiapi::common::types::DocumentSpecifier) -> Option<PathBuf> {
+    use kiapi::common::types::document_specifier::Identifier;
+    let filename = match doc.identifier.as_ref()? {
+        Identifier::BoardFilename(f) if !f.is_empty() => f,
+        _ => return None,
+    };
+    let dir = doc.project.as_ref().map(|p| p.path.as_str()).unwrap_or("");
+    if dir.is_empty() {
+        Some(PathBuf::from(filename))
+    } else {
+        Some(Path::new(dir).join(filename))
+    }
+}
+
+/// Whether `a` and `b` name the same board file.
+///
+/// Canonicalizes both when both exist on disk (resolving symlinks, `..`, and
+/// `/tmp` → `/private/tmp` on macOS). When canonicalization is unavailable the
+/// comparison falls back to file name plus parent directory, canonicalizing
+/// whichever parent exists. Deliberately conservative: anything it cannot
+/// positively confirm is *not* a match, so an unverifiable board never gets
+/// edited through IPC.
+pub fn same_board_file(a: &Path, b: &Path) -> bool {
+    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
+        return ca == cb;
+    }
+    match (a.file_name(), b.file_name()) {
+        (Some(fa), Some(fb)) if fa == fb => {}
+        _ => return false,
+    }
+    let norm = |p: &Path| -> PathBuf {
+        let parent = p.parent().unwrap_or_else(|| Path::new(""));
+        // An empty parent means a bare filename with no directory at all; it
+        // cannot be confirmed to live anywhere, so keep it distinct.
+        parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf())
+    };
+    let (na, nb) = (norm(a), norm(b));
+    !na.as_os_str().is_empty() && na == nb
 }
 
 pub struct KiCadIpcClient {
@@ -205,6 +260,33 @@ impl KiCadIpcClient {
         }
     }
 
+    /// The full path of the board KiCAD currently has open, if any.
+    ///
+    /// Every IPC command implicitly targets this board — there is no way to
+    /// address a board by path — so a tool that was handed a `board` argument
+    /// must check this first and fall back to editing the file directly when it
+    /// does not match. `Ok(None)` means KiCAD is reachable but has no PCB open
+    /// (or reported one without a filename); an `Err` means KiCAD is not
+    /// reachable at all.
+    pub fn open_board_path(&self) -> Result<Option<PathBuf>> {
+        Ok(self
+            .get_open_documents()?
+            .iter()
+            .find_map(document_board_path))
+    }
+
+    /// Whether the board KiCAD has open is the file at `path`.
+    ///
+    /// Returns `false` — never an error — when KiCAD is unreachable, has no
+    /// board open, or has a different board open, so callers can use it as a
+    /// plain "is the IPC path safe here?" gate.
+    pub fn open_board_is(&self, path: &Path) -> bool {
+        match self.open_board_path() {
+            Ok(Some(open)) => same_board_file(&open, path),
+            _ => false,
+        }
+    }
+
     /// Get the first open PCB's DocumentSpecifier (needed for most commands).
     fn get_board_document(&self) -> Result<kiapi::common::types::DocumentSpecifier> {
         let docs = self.get_open_documents()?;
@@ -346,6 +428,32 @@ impl KiCadIpcClient {
         };
         self.send_command(&cmd, "kiapi.common.commands.DeleteItems")?;
         Ok(())
+    }
+
+    /// Delete every graphic shape on `layer` (e.g. `"Edge.Cuts"`), returning
+    /// how many were removed.
+    ///
+    /// `create_items` only ever appends, so an operation with *set* semantics
+    /// (`set_board_size` replacing the outline) has to clear the old shapes
+    /// first or it leaves two overlapping outlines behind.
+    pub fn delete_shapes_on_layer(&self, layer: &str) -> Result<usize> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbShape)?;
+        let mut ids = Vec::new();
+        for item in &items {
+            if let Ok(shape) = kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice())
+            {
+                if layer_enum_to_name(shape.layer) == layer {
+                    if let Some(id) = shape.id {
+                        ids.push(id.value);
+                    }
+                }
+            }
+        }
+        let n = ids.len();
+        if n > 0 {
+            self.delete_items(ids)?;
+        }
+        Ok(n)
     }
 
     /// Refill zones on the board.
@@ -775,5 +883,90 @@ impl KiCadIpcClient {
         };
         self.send_command(&cmd, "kiapi.common.commands.RunAction")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod board_identity_tests {
+    use super::*;
+    use kiapi::common::types::{
+        document_specifier::Identifier, DocumentSpecifier, DocumentType, ProjectSpecifier,
+    };
+
+    fn pcb_doc(project_dir: &str, filename: &str) -> DocumentSpecifier {
+        DocumentSpecifier {
+            r#type: DocumentType::DoctypePcb as i32,
+            project: Some(ProjectSpecifier {
+                name: "proj".to_string(),
+                path: project_dir.to_string(),
+            }),
+            identifier: Some(Identifier::BoardFilename(filename.to_string())),
+        }
+    }
+
+    #[test]
+    fn document_board_path_joins_project_dir_and_bare_filename() {
+        let doc = pcb_doc("/home/u/proj", "board.kicad_pcb");
+        assert_eq!(
+            document_board_path(&doc),
+            Some(PathBuf::from("/home/u/proj/board.kicad_pcb"))
+        );
+    }
+
+    #[test]
+    fn document_board_path_without_project_dir_is_the_bare_filename() {
+        let mut doc = pcb_doc("", "board.kicad_pcb");
+        doc.project = None;
+        assert_eq!(
+            document_board_path(&doc),
+            Some(PathBuf::from("board.kicad_pcb"))
+        );
+    }
+
+    #[test]
+    fn document_board_path_is_none_without_a_board_filename() {
+        let mut doc = pcb_doc("/home/u/proj", "board.kicad_pcb");
+        doc.identifier = None;
+        assert_eq!(document_board_path(&doc), None);
+    }
+
+    #[test]
+    fn same_board_file_sees_through_dot_segments() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(same_board_file(
+            &manifest.join("Cargo.toml"),
+            &manifest.join(".").join("Cargo.toml")
+        ));
+    }
+
+    #[test]
+    fn same_board_file_rejects_same_name_in_a_different_directory() {
+        // The reported bug: a sandbox copy at /tmp/ktest/test.kicad_pcb must
+        // never be treated as the project's own test.kicad_pcb.
+        assert!(!same_board_file(
+            Path::new("/tmp/ktest/test.kicad_pcb"),
+            Path::new("/home/u/proj/test.kicad_pcb")
+        ));
+    }
+
+    #[test]
+    fn same_board_file_matches_missing_files_in_the_same_real_directory() {
+        // Neither file exists (the board may be about to be created), but both
+        // parents resolve to the same real directory.
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(same_board_file(
+            &manifest.join("no-such-board.kicad_pcb"),
+            &manifest.join("src").join("..").join("no-such-board.kicad_pcb")
+        ));
+    }
+
+    #[test]
+    fn same_board_file_rejects_a_bare_filename_with_no_directory() {
+        // "board.kicad_pcb" names no confirmable location, so it must not be
+        // taken as a match for a real path that happens to end the same way.
+        assert!(!same_board_file(
+            Path::new("board.kicad_pcb"),
+            Path::new("/home/u/proj/board.kicad_pcb")
+        ));
     }
 }

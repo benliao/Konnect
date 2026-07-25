@@ -601,38 +601,43 @@ async fn handle_refill_zones(
 
     // kicad-cli pcb export gerber triggers zone fills as a side-effect,
     // but the proper command is kicad-cli pcb --refill-zones (not in all versions).
-    // Use IPC refill_zones when available, otherwise fall back to file-level
-    // zone fill marker update.
-    let addr = ctx.config.ipc_address.clone();
-    let result = with_ipc(addr, move |client| {
-        client.refill_zones()?;
-        Ok(())
-    })
-    .await;
+    // Use IPC refill_zones when available; there is no file-level fallback.
+    //
+    // The IPC command lands on whatever board KiCAD has open, so it may only be
+    // sent once that board is confirmed to be the one named in `board` —
+    // otherwise this silently refills a *different* project's zones and reports
+    // success against the caller's path.
+    if crate::tools::pcb_board::ipc_targets_board(ctx.config.ipc_address.clone(), &board).await {
+        let addr = ctx.config.ipc_address.clone();
+        let result = with_ipc(addr, move |client| {
+            client.refill_zones()?;
+            Ok(())
+        })
+        .await;
 
-    match result {
-        Ok(Ok(())) => Ok(CallToolResult::text(
-            serde_json::to_string_pretty(&json!({
-                "success": true,
-                "method": "ipc",
-                "board": board.to_str().unwrap_or("")
-            }))
-            .unwrap(),
-        )),
-        _ => {
-            // Fallback: run kicad-cli with zone-fill option if supported
-            // kicad-cli pcb export gerber fills zones as a side effect
-            // For now report the limitation
-            Ok(CallToolResult::text(
+        if let Ok(Ok(())) = result {
+            return Ok(CallToolResult::text(
                 serde_json::to_string_pretty(&json!({
-                    "success": false,
-                    "note": "Zone refill requires a running KiCAD instance with IPC enabled, or manual zone fill in KiCAD GUI",
+                    "success": true,
+                    "method": "ipc",
+                    "target": board.to_str().unwrap_or(""),
                     "board": board.to_str().unwrap_or("")
                 }))
                 .unwrap(),
-            ))
+            ));
         }
     }
+
+    Ok(CallToolResult::text(
+        serde_json::to_string_pretty(&json!({
+            "success": false,
+            "note": "Zone refill requires the board to be open in a running KiCAD instance with \
+                     IPC enabled (KiCAD has no way to refill a board it does not have open). \
+                     Open this exact file in KiCAD, or fill the zones in the KiCAD GUI.",
+            "board": board.to_str().unwrap_or("")
+        }))
+        .unwrap(),
+    ))
 }
 
 async fn handle_get_drc_violations(
