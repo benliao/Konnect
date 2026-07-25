@@ -18,6 +18,9 @@ pub struct IpcFootprint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcTrack {
+    /// KiCAD's KIID for this segment. `delete_trace` takes a uuid, so dropping
+    /// it here made queried traces undeletable.
+    pub uuid: String,
     pub net_name: String,
     pub layer: String,
     pub width: f64,

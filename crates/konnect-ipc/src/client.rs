@@ -631,6 +631,11 @@ impl KiCadIpcClient {
                 let start = track.start.as_ref();
                 let end = track.end.as_ref();
                 tracks.push(IpcTrack {
+                    uuid: track
+                        .id
+                        .as_ref()
+                        .map(|k| k.value.clone())
+                        .unwrap_or_default(),
                     net_name: net_name.to_string(),
                     layer: layer_name.to_string(),
                     width: track

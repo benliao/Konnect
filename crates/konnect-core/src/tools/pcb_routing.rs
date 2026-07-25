@@ -99,12 +99,14 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "route_pad_to_pad",
-            "Route a direct trace between two pads of named components (L-bend routing) via KiCAD IPC.",
+            "Route a direct trace between two pads of named components (L-bend routing) via KiCAD IPC. \
+             Both pads must already be on the same net; the tool refuses to connect different \
+             nets rather than silently creating a short.",
             json!({
                 "type": "object",
                 "properties": {
                     "board":       { "type": "string" },
-                    "net_name":    { "type": "string" },
+                    "net_name":    { "type": "string", "description": "Optional. If given, asserted against the pads' actual net; the board's assignment always wins" },
                     "ref1":        { "type": "string", "description": "First component reference" },
                     "pad1":        { "type": "string", "description": "First pad number" },
                     "ref2":        { "type": "string", "description": "Second component reference" },
@@ -112,13 +114,14 @@ pub fn tools() -> Vec<ToolDef> {
                     "layer":       { "type": "string", "default": "F.Cu" },
                     "width":       { "type": "number", "default": 0.25 }
                 },
-                "required": ["board", "net_name", "ref1", "pad1", "ref2", "pad2"]
+                "required": ["board", "ref1", "pad1", "ref2", "pad2"]
             }),
             |args, ctx| async move { handle_route_pad_to_pad(args, ctx).await }
         ),
         tool!(
             "add_via",
-            "Add a through-hole via at a given position and assign it to a net via KiCAD IPC.",
+            "Add a via at a given position on an existing net. Written directly to the .kicad_pcb \
+             file. The net must already exist on the board.",
             json!({
                 "type": "object",
                 "properties": {
@@ -127,7 +130,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "x":         { "type": "number" },
                     "y":         { "type": "number" },
                     "drill":     { "type": "number", "description": "Drill diameter in mm", "default": 0.4 },
-                    "pad_size":  { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 }
+                    "pad_size":  { "type": "number", "description": "Via pad diameter in mm", "default": 0.8 },
+                    "start_layer": { "type": "string", "description": "Start copper layer", "default": "F.Cu" },
+                    "end_layer":   { "type": "string", "description": "End copper layer", "default": "B.Cu" }
                 },
                 "required": ["board", "net_name", "x", "y"]
             }),
@@ -372,10 +377,8 @@ async fn handle_route_pad_to_pad(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
-    let net_name = match require_str(args, "net_name") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
+    // Optional: the board's own pad assignments are the source of truth.
+    let net_name = args["net_name"].as_str().unwrap_or("").to_string();
     let ref1 = match require_str(args, "ref1") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -415,6 +418,45 @@ async fn handle_route_pad_to_pad(
     let content = std::fs::read_to_string(&board_path)?;
     let tree = konnect_sexp::parser::parse_sexp(&content)?;
 
+    // Both pads must already be on the same net. Trusting the caller's
+    // `net_name` let a mistyped argument draw a trace between two different
+    // nets — a short that exists nowhere in the schematic, reported as
+    // `routed: true` and only findable later by DRC.
+    let net1 = find_pad_net(&tree, &ref1, &pad1)?;
+    let net2 = find_pad_net(&tree, &ref2, &pad2)?;
+    let resolved = match (&net1, &net2) {
+        (Some(a), Some(b)) if a == b => a.clone(),
+        (Some(a), Some(b)) => {
+            return Ok(CallToolResult::error(format!(
+                "Refusing to route: {ref1}.{pad1} is on net '{a}' but {ref2}.{pad2} \
+                 is on net '{b}'. Connecting them would short two different nets. \
+                 Check the pad numbers, or fix the connection in the schematic and \
+                 re-import the netlist."
+            )));
+        }
+        (None, _) | (_, None) => {
+            let (r, p) = if net1.is_none() {
+                (&ref1, &pad1)
+            } else {
+                (&ref2, &pad2)
+            };
+            return Ok(CallToolResult::error(format!(
+                "Refusing to route: {r}.{p} is not assigned to any net on this \
+                 board, so a trace to it would not belong to a net. Import the \
+                 netlist from the schematic first."
+            )));
+        }
+    };
+    // `net_name` degrades to an optional assertion against the board's truth.
+    if !net_name.is_empty() && net_name != resolved {
+        return Ok(CallToolResult::error(format!(
+            "Refusing to route: net_name '{net_name}' was given, but {ref1}.{pad1} \
+             and {ref2}.{pad2} are both on '{resolved}'. Pass net_name='{resolved}' \
+             or omit it."
+        )));
+    }
+    let net_name = resolved;
+
     let pos1 = find_pad_board_position(&tree, &ref1, &pad1)?;
     let pos2 = find_pad_board_position(&tree, &ref2, &pad2)?;
 
@@ -452,6 +494,44 @@ async fn handle_route_pad_to_pad(
 }
 
 /// Look up a pad's board-space (x, y) position from the parsed PCB S-expression tree.
+/// The net a pad belongs to, as recorded on the board.
+///
+/// KiCAD 10 writes `(net "GND")` on the pad; older boards write
+/// `(net 1 "GND")`. Returns `None` for an unconnected pad.
+fn find_pad_net(
+    tree: &konnect_sexp::parser::SexpNode,
+    reference: &str,
+    pad_number: &str,
+) -> anyhow::Result<Option<String>> {
+    let fp_node = tree
+        .find_all("footprint")
+        .into_iter()
+        .find(|fp| {
+            fp.find_all("property").iter().any(|p| {
+                p.get(1).and_then(|n| n.as_str()) == Some("Reference")
+                    && p.get(2).and_then(|n| n.as_str()) == Some(reference)
+            })
+        })
+        .ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found on board", reference))?;
+
+    let pad = fp_node
+        .find_all("pad")
+        .into_iter()
+        .find(|p| p.get(1).and_then(|n| n.as_str()) == Some(pad_number))
+        .ok_or_else(|| anyhow::anyhow!("Pad '{}' not found on '{}'", pad_number, reference))?;
+
+    let Some(net) = pad.find("net") else {
+        return Ok(None);
+    };
+    // `(net "GND")` -> arg 1 is the name; `(net 1 "GND")` -> arg 2 is.
+    let name = net
+        .get(1)
+        .and_then(|n| n.as_str())
+        .filter(|s| s.parse::<i32>().is_err())
+        .or_else(|| net.get(2).and_then(|n| n.as_str()));
+    Ok(name.filter(|s| !s.is_empty()).map(str::to_string))
+}
+
 fn find_pad_board_position(
     tree: &konnect_sexp::parser::SexpNode,
     reference: &str,
@@ -492,10 +572,36 @@ fn find_pad_board_position(
     ))
 }
 
+/// A `(via …)` in KiCAD 10's format, read off a real 20260206 board:
+///
+/// ```text
+/// (via (at X Y) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net "+3V3") (uuid …))
+/// ```
+fn format_via(
+    net: &crate::tools::NetRef,
+    x: f64,
+    y: f64,
+    drill: f64,
+    size: f64,
+    start_layer: &str,
+    end_layer: &str,
+) -> String {
+    let uuid = new_uuid();
+    // The via's net field follows the board's own convention, same as a zone's.
+    let net_field = match net {
+        crate::tools::NetRef::Named(n) => format!("(net \"{n}\")"),
+        crate::tools::NetRef::Numbered(id, _) => format!("(net {id})"),
+    };
+    format!(
+        "\n\t(via\n\t\t(at {x} {y})\n\t\t(size {size})\n\t\t(drill {drill})\n\t\t         (layers \"{start_layer}\" \"{end_layer}\")\n\t\t{net_field}\n\t\t(uuid \"{uuid}\")\n\t)"
+    )
+}
+
 async fn handle_add_via(
     args: &serde_json::Value,
-    ctx: &ToolContext,
+    _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
     let net_name = match require_str(args, "net_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -510,12 +616,45 @@ async fn handle_add_via(
     };
     let drill = args["drill"].as_f64().unwrap_or(0.4);
     let pad_size = args["pad_size"].as_f64().unwrap_or(0.8);
+    let start_layer = args["start_layer"].as_str().unwrap_or("F.Cu");
+    let end_layer = args["end_layer"].as_str().unwrap_or("B.Cu");
 
-    let net_ipc = net_name.clone();
-    ipc!(ctx, |c| c.add_via(&net_ipc, x, y, drill, pad_size));
-    Ok(CallToolResult::json(
-        &json!({ "net": net_name, "x": x, "y": y, "drill": drill, "pad_size": pad_size }),
-    ))
+    if pad_size <= drill {
+        return Ok(CallToolResult::error(format!(
+            "Via pad_size ({pad_size}mm) must be larger than drill ({drill}mm)."
+        )));
+    }
+
+    // Written to the file rather than over IPC: KiCAD 10.0.4 rejects the Via
+    // message this client builds ("could not unpack PCB_VIA from request"),
+    // and its actual protobuf schema is not shipped with the application, so
+    // the mismatch cannot be verified from here. The file format is known and
+    // testable, and vias are the only way to change layers — leaving this on a
+    // broken transport makes multilayer boards impossible to finish.
+    let content = std::fs::read_to_string(&board_path)?;
+    let Some(net) = crate::tools::resolve_net(&content, &net_name) else {
+        return Ok(crate::tools::net_not_found_error(&content, &net_name));
+    };
+
+    let via = format_via(&net, x, y, drill, pad_size, start_layer, end_layer);
+    let close_pos = content.rfind(')').unwrap_or(content.len());
+    let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, via)]);
+    if let Err(why) = konnect_sexp::writer::check_document(&new_content, "kicad_pcb") {
+        return Ok(CallToolResult::error(format!(
+            "Internal error: adding the via would have corrupted '{}' ({why}) — \
+             nothing was written.",
+            board_path.display()
+        )));
+    }
+    write_atomic(&board_path, &new_content)?;
+
+    Ok(CallToolResult::json(&json!({
+        "net": net.name(), "x": x, "y": y,
+        "drill": drill, "pad_size": pad_size,
+        "layers": [start_layer, end_layer],
+        "source": "file",
+        "note": "KiCAD reloads the board from disk; if it is open, use File > Revert to see the via."
+    })))
 }
 
 async fn handle_add_copper_pour(
@@ -589,6 +728,9 @@ async fn handle_query_traces(
         .iter()
         .map(|t| {
             json!({
+                // uuid is what delete_trace takes — without it a queried
+                // trace could not be deleted.
+                "uuid": t.uuid,
                 "net": t.net_name, "layer": t.layer, "width": t.width,
                 "x1": t.start.x, "y1": t.start.y,
                 "x2": t.end.x,   "y2": t.end.y
@@ -843,4 +985,67 @@ async fn handle_route_diff_pair(
         "net_pos": net_pos, "net_neg": net_neg,
         "layer": layer, "width": width, "gap": gap
     })))
+}
+
+#[cfg(test)]
+mod routing_safety_tests {
+    use super::*;
+    use crate::tools::NetRef;
+    use konnect_sexp::parser::parse_sexp;
+
+    /// Tab-indented, KiCAD 10 by-name nets. TP3.1 is +3V3, C12.1 is /OSC_OUT —
+    /// the pair from the short-circuit report.
+    const BOARD: &str = "(kicad_pcb\n\t(version 20260206)\n\
+\t(footprint \"TP\"\n\t\t(at 10 10)\n\t\t(property \"Reference\" \"TP3\")\n\
+\t\t(pad \"1\" smd rect\n\t\t\t(at 0 0)\n\t\t\t(net \"+3V3\")\n\t\t)\n\t)\n\
+\t(footprint \"C\"\n\t\t(at 20 20)\n\t\t(property \"Reference\" \"C12\")\n\
+\t\t(pad \"1\" smd rect\n\t\t\t(at 0 0)\n\t\t\t(net \"/OSC_OUT\")\n\t\t)\n\
+\t\t(pad \"2\" smd rect\n\t\t\t(at 1 0)\n\t\t)\n\t)\n)\n";
+
+    fn tree() -> konnect_sexp::parser::SexpNode {
+        parse_sexp(BOARD).unwrap()
+    }
+
+    #[test]
+    fn reads_a_pads_actual_net_by_name() {
+        assert_eq!(
+            find_pad_net(&tree(), "TP3", "1").unwrap(),
+            Some("+3V3".to_string())
+        );
+        assert_eq!(
+            find_pad_net(&tree(), "C12", "1").unwrap(),
+            Some("/OSC_OUT".to_string())
+        );
+        // A pad with no (net …) is unassigned, not net "".
+        assert_eq!(find_pad_net(&tree(), "C12", "2").unwrap(), None);
+    }
+
+    #[test]
+    fn reads_a_pads_net_in_the_numbered_format_too() {
+        let old = "(kicad_pcb\n\t(footprint \"R\"\n\t\t(property \"Reference\" \"R1\")\n\
+\t\t(pad \"1\" smd rect\n\t\t\t(net 7 \"GND\")\n\t\t)\n\t)\n)\n";
+        assert_eq!(
+            find_pad_net(&parse_sexp(old).unwrap(), "R1", "1").unwrap(),
+            Some("GND".to_string())
+        );
+    }
+
+    /// The via format is taken verbatim from a real KiCAD 10 board; KiCAD's own
+    /// DRC reports one written this way as "Via [+3V3] on F.Cu - B.Cu".
+    #[test]
+    fn via_is_written_in_the_boards_net_convention() {
+        let named = format_via(&NetRef::Named("+3V3".into()), 58.92, 60.0, 0.3, 0.6, "F.Cu", "B.Cu");
+        assert!(named.contains("(net \"+3V3\")"), "{named}");
+        assert!(named.contains("(size 0.6)") && named.contains("(drill 0.3)"));
+        assert!(named.contains("(layers \"F.Cu\" \"B.Cu\")"));
+        assert!(!named.contains("net_name"), "vias carry no net_name field");
+
+        let numbered = format_via(&NetRef::Numbered(7, "GND".into()), 1.0, 2.0, 0.3, 0.6, "F.Cu", "B.Cu");
+        assert!(numbered.contains("(net 7)"), "{numbered}");
+
+        // Must drop into a board and still parse.
+        let board = BOARD.trim_end().trim_end_matches(')').to_string() + &named + "\n)\n";
+        konnect_sexp::writer::check_document(&board, "kicad_pcb")
+            .expect("a board with the via must still parse");
+    }
 }

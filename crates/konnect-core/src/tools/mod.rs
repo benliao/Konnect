@@ -787,9 +787,9 @@ pub fn net_not_found_error(content: &str, net_name: &str) -> CallToolResult {
     let sample: Vec<&String> = known.iter().take(12).collect();
 
     CallToolResult::error(format!(
-        "Net '{net_name}' does not exist on this board. Refusing to write a zone \
-         with no net — that produces copper connected to nothing, which DRC does \
-         not flag. Nets on this board: {}{}",
+        "Net '{net_name}' does not exist on this board. Refusing to write copper \
+         with no net — it would be connected to nothing, which DRC does not flag \
+         for a zone. Nets on this board: {}{}",
         sample
             .iter()
             .map(|s| s.as_str())
