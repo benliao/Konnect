@@ -262,7 +262,8 @@ fn delete_range(
     what: &str,
     board: &Path,
 ) -> Result<(usize, usize), String> {
-    let Some((del_start, del_end)) = find_block_with_leading_whitespace(content, block_start) else {
+    let Some((del_start, del_end)) = find_block_with_leading_whitespace(content, block_start)
+    else {
         return Err(format!(
             "Refusing to delete {what}: its byte range in '{}' could not be established. \
              Nothing was written.",
@@ -730,6 +731,20 @@ impl ComponentKey {
     }
 }
 
+/// The footprint `key` names, or the error explaining what is on the board
+/// instead. Every tool that takes a component resolves it through here, so they
+/// all refuse the same way.
+fn find_footprint(
+    content: &str,
+    key: &ComponentKey,
+    board: &Path,
+) -> Result<BoardFootprint, CallToolResult> {
+    collect_footprints(content)
+        .into_iter()
+        .find(|f| key.matches(f))
+        .ok_or_else(|| CallToolResult::error(unknown_component_message(content, key, board)))
+}
+
 /// Read the `reference` / `uuid` argument, or the error to return.
 fn component_key(args: &serde_json::Value) -> Result<ComponentKey, CallToolResult> {
     if let Some(r) = args["reference"].as_str().filter(|s| !s.is_empty()) {
@@ -801,7 +816,13 @@ fn footprint_json(fp: &BoardFootprint) -> serde_json::Value {
 /// to the footprint origin and moves with it for free. Measured against 481
 /// footprint moves in KiCAD's own save history, where a move changed exactly one
 /// line of the file and 0 of 4012 child `(at …)` were translated.
-fn move_edits(content: &str, board: &Path, fp: &BoardFootprint, x: f64, y: f64) -> Result<Vec<SexpEdit>, String> {
+fn move_edits(
+    content: &str,
+    board: &Path,
+    fp: &BoardFootprint,
+    x: f64,
+    y: f64,
+) -> Result<Vec<SexpEdit>, String> {
     fp.require_relative_geometry(board, "move")?;
     let at = fp.require_at(board)?;
     Ok([at.set_token(content, 0, x), at.set_token(content, 1, y)]
@@ -826,10 +847,9 @@ fn rotate_edits(
     fp.require_relative_geometry(board, "rotate")?;
     let at = fp.require_at(board)?;
     let target = wrap_angle(angle);
-    let delta = target - at.angle;
 
     let mut edits: Vec<SexpEdit> = at.set_angle(content, target).into_iter().collect();
-    if delta == 0.0 {
+    if target == at.angle {
         return Ok(edits);
     }
     for (tag, child) in &fp.child_ats {
@@ -837,7 +857,10 @@ fn rotate_edits(
         // the tags measured to carry board-space angles — for anything else,
         // adding a field the format may not accept there is a guess.
         if child.has_angle || ANGLE_CHILDREN.contains(&tag.as_str()) {
-            edits.extend(child.set_angle(content, child.angle + delta));
+            // Re-derive from the child's own offset rather than adding the raw
+            // delta, so the number written stays inside one turn.
+            let turned = target + angle_offset(child.angle, at.angle);
+            edits.extend(child.set_angle(content, turned));
         }
     }
     Ok(edits)
@@ -1102,12 +1125,9 @@ async fn handle_find_component(
     };
 
     let content = std::fs::read_to_string(&board_path)?;
-    let Some(fp) = collect_footprints(&content).into_iter().find(|f| key.matches(f)) else {
-        return Ok(CallToolResult::error(unknown_component_message(
-            &content,
-            &key,
-            &board_path,
-        )));
+    let fp = match find_footprint(&content, &key, &board_path) {
+        Ok(f) => f,
+        Err(e) => return Ok(e),
     };
 
     let mut out = footprint_json(&fp);
@@ -1142,12 +1162,9 @@ async fn handle_move_component(
     };
 
     let content = std::fs::read_to_string(&board_path)?;
-    let Some(fp) = collect_footprints(&content).into_iter().find(|f| key.matches(f)) else {
-        return Ok(CallToolResult::error(unknown_component_message(
-            &content,
-            &key,
-            &board_path,
-        )));
+    let fp = match find_footprint(&content, &key, &board_path) {
+        Ok(f) => f,
+        Err(e) => return Ok(e),
     };
 
     let (from_x, from_y) = fp.at.as_ref().map(|a| (a.x, a.y)).unzip();
@@ -1188,12 +1205,9 @@ async fn handle_rotate_component(
     };
 
     let content = std::fs::read_to_string(&board_path)?;
-    let Some(fp) = collect_footprints(&content).into_iter().find(|f| key.matches(f)) else {
-        return Ok(CallToolResult::error(unknown_component_message(
-            &content,
-            &key,
-            &board_path,
-        )));
+    let fp = match find_footprint(&content, &key, &board_path) {
+        Ok(f) => f,
+        Err(e) => return Ok(e),
     };
 
     let was = fp.at.as_ref().map(|a| a.angle);
@@ -1233,12 +1247,9 @@ async fn handle_delete_component(
     };
 
     let content = std::fs::read_to_string(&board_path)?;
-    let Some(fp) = collect_footprints(&content).into_iter().find(|f| key.matches(f)) else {
-        return Ok(CallToolResult::error(unknown_component_message(
-            &content,
-            &key,
-            &board_path,
-        )));
+    let fp = match find_footprint(&content, &key, &board_path) {
+        Ok(f) => f,
+        Err(e) => return Ok(e),
     };
 
     let (del_start, del_end) = match delete_range(
@@ -1308,18 +1319,14 @@ async fn handle_edit_component(
     }
     if wanted.is_empty() {
         return Ok(CallToolResult::error(
-            "Nothing to change: pass 'value', or 'properties' as a name→value object."
-                .to_string(),
+            "Nothing to change: pass 'value', or 'properties' as a name→value object.".to_string(),
         ));
     }
 
     let content = std::fs::read_to_string(&board_path)?;
-    let Some(fp) = collect_footprints(&content).into_iter().find(|f| key.matches(f)) else {
-        return Ok(CallToolResult::error(unknown_component_message(
-            &content,
-            &key,
-            &board_path,
-        )));
+    let fp = match find_footprint(&content, &key, &board_path) {
+        Ok(f) => f,
+        Err(e) => return Ok(e),
     };
 
     // Renaming a footprint on the PCB alone desynchronises it from the
@@ -1444,7 +1451,11 @@ async fn handle_align_components(
     for fp in &targets {
         let at = match fp.require_at(&board_path) {
             Ok(a) => a,
-            Err(e) => return Ok(CallToolResult::error(format!("{e} No footprint was moved."))),
+            Err(e) => {
+                return Ok(CallToolResult::error(format!(
+                    "{e} No footprint was moved."
+                )))
+            }
         };
         let (nx, ny) = if axis == "y" {
             (at.x, value)
@@ -1453,7 +1464,11 @@ async fn handle_align_components(
         };
         match move_edits(&content, &board_path, fp, nx, ny) {
             Ok(e) => edits.extend(e),
-            Err(e) => return Ok(CallToolResult::error(format!("{e} No footprint was moved."))),
+            Err(e) => {
+                return Ok(CallToolResult::error(format!(
+                    "{e} No footprint was moved."
+                )))
+            }
         }
         aligned.push(json!({
             "reference": fp.reference, "uuid": fp.uuid,
@@ -2010,7 +2025,10 @@ mod component_file_tests {
         assert_eq!(r9.at.as_ref().map(|a| (a.x, a.y)), Some((3.0, 4.0)));
         // The single-line footprint parses exactly like the indented ones.
         let c9 = fp_by_ref(&content, "C9");
-        assert_eq!(c9.at.as_ref().map(|a| (a.x, a.y, a.angle)), Some((7.0, 8.0, 180.0)));
+        assert_eq!(
+            c9.at.as_ref().map(|a| (a.x, a.y, a.angle)),
+            Some((7.0, 8.0, 180.0))
+        );
     }
 
     // ─── Reads ────────────────────────────────────────────────────────────────
@@ -2019,12 +2037,10 @@ mod component_file_tests {
     async fn get_component_list_reads_the_board_file() {
         let dir = tempfile::tempdir().unwrap();
         let board = board_file(dir.path(), &kicad10_board());
-        let res = handle_get_component_list(
-            &json!({ "board": board.to_str().unwrap() }),
-            &test_ctx(),
-        )
-        .await
-        .unwrap();
+        let res =
+            handle_get_component_list(&json!({ "board": board.to_str().unwrap() }), &test_ctx())
+                .await
+                .unwrap();
         assert!(!res.is_error, "{:?}", body(&res));
         let b = body(&res);
         assert_eq!(b["count"], json!(3));
@@ -2390,18 +2406,27 @@ mod component_file_tests {
         let b = board.to_str().unwrap();
 
         let calls: Vec<CallToolResult> = vec![
-            handle_move_component(&json!({ "board": b, "reference": "U9", "x": 1, "y": 2 }), &ctx)
-                .await
-                .unwrap(),
-            handle_rotate_component(&json!({ "board": b, "reference": "U9", "rotation": 90 }), &ctx)
-                .await
-                .unwrap(),
+            handle_move_component(
+                &json!({ "board": b, "reference": "U9", "x": 1, "y": 2 }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+            handle_rotate_component(
+                &json!({ "board": b, "reference": "U9", "rotation": 90 }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
             handle_delete_component(&json!({ "board": b, "reference": "U9" }), &ctx)
                 .await
                 .unwrap(),
-            handle_edit_component(&json!({ "board": b, "reference": "U9", "value": "x" }), &ctx)
-                .await
-                .unwrap(),
+            handle_edit_component(
+                &json!({ "board": b, "reference": "U9", "value": "x" }),
+                &ctx,
+            )
+            .await
+            .unwrap(),
             handle_find_component(&json!({ "board": b, "reference": "U9" }), &ctx)
                 .await
                 .unwrap(),
@@ -2476,101 +2501,5 @@ mod component_file_tests {
         // the defect that once erased a whole file.
         let err = delete_range(&content, fp.start, fp.end - 1, "R1", board).unwrap_err();
         assert!(err.contains("Refusing to delete"), "{err}");
-    }
-}
-
-#[cfg(test)]
-mod scratch_real_board {
-    use super::*;
-    use crate::router::ToolRouter;
-    use crate::tools::ServerConfig;
-    use std::sync::Arc;
-
-    fn ctx() -> ToolContext {
-        ToolContext::new(
-            ServerConfig { kicad_cli: String::new(), kicad_binary: String::new(),
-                ipc_address: String::new(), project_dir: None, jlcpcb_db_path: None },
-            Arc::new(ToolRouter::new()),
-        )
-    }
-
-    #[tokio::test]
-    async fn real_boards() {
-        let mut all = Vec::new();
-        fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            let Ok(rd) = std::fs::read_dir(d) else { return };
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    if !p.file_name().map(|n| n.to_string_lossy().starts_with('.')).unwrap_or(false) { walk(&p, out); }
-                } else if p.extension().map(|x| x == "kicad_pcb").unwrap_or(false) { out.push(p); }
-            }
-        }
-        walk(std::path::Path::new("/Users/benliao/pcb"), &mut all);
-        eprintln!("sweeping {} boards", all.len());
-        let mut total_fp = 0usize;
-        for src in all.iter().map(|p| p.to_str().unwrap()) {
-            let Ok(original) = std::fs::read_to_string(src) else { continue };
-            let dir = tempfile::tempdir().unwrap();
-            let board = dir.path().join("b.kicad_pcb");
-            std::fs::write(&board, &original).unwrap();
-            let b = board.to_str().unwrap();
-
-            let fps = collect_footprints(&original);
-            total_fp += fps.len();
-            if fps.is_empty() { continue; }
-            let with_ref = fps.iter().filter(|f| f.reference.is_some()).count();
-            let with_at = fps.iter().filter(|f| f.at.is_some()).count();
-            let abs = fps.iter().filter(|f| !f.absolute_children.is_empty()).count();
-            if with_at != fps.len() || abs > 0 { eprintln!("{src}: {} footprints, {with_ref} ref, {with_at} at, {abs} absolute", fps.len()); }
-            assert_eq!(with_at, fps.len(), "every footprint must have a readable (at)");
-
-            // pick a movable one
-            let Some(target) = fps.iter().find(|f| f.reference.is_some() && f.absolute_children.is_empty()) else { continue };
-            let r = target.reference.clone().unwrap();
-            let at = target.at.clone().unwrap();
-
-            // move away and back
-            let res = handle_move_component(&json!({"board": b, "reference": r, "x": at.x + 13.5, "y": at.y - 7.25}), &ctx()).await.unwrap();
-            assert!(!res.is_error, "{:?}", res.content);
-            let moved = std::fs::read_to_string(&board).unwrap();
-            assert_ne!(moved, original);
-            let changed = original.lines().zip(moved.lines()).filter(|(a,b)| a!=b).count();
-            assert_eq!(changed, 1, "a move must change exactly one line on {src}");
-            let res = handle_move_component(&json!({"board": b, "reference": r, "x": at.x, "y": at.y}), &ctx()).await.unwrap();
-            assert!(!res.is_error);
-            assert_eq!(std::fs::read_to_string(&board).unwrap(), original, "move round trip on {src}");
-
-            // rotate away and back
-            let res = handle_rotate_component(&json!({"board": b, "reference": r, "rotation": at.angle + 90.0}), &ctx()).await.unwrap();
-            assert!(!res.is_error, "{:?}", res.content);
-            let rot = std::fs::read_to_string(&board).unwrap();
-            let after = fp_by_ref_scratch(&rot, &r);
-            let before = fp_by_ref_scratch(&original, &r);
-            assert_eq!(after.at.as_ref().unwrap().angle, wrap_angle(at.angle + 90.0));
-            for ((tb, cb), (ta, ca)) in before.child_ats.iter().zip(after.child_ats.iter()) {
-                assert_eq!(tb, ta);
-                assert_eq!((cb.x, cb.y), (ca.x, ca.y), "{src} {r}: a rotate moved a child offset");
-                assert_eq!(wrap_angle(cb.angle + 90.0), ca.angle, "{src} {r}: child angle");
-            }
-            let res = handle_rotate_component(&json!({"board": b, "reference": r, "rotation": at.angle}), &ctx()).await.unwrap();
-            assert!(!res.is_error);
-
-            // delete: everything else stays byte-identical
-            let res = handle_delete_component(&json!({"board": b, "reference": r}), &ctx()).await.unwrap();
-            assert!(!res.is_error, "{:?}", res.content);
-            let del = std::fs::read_to_string(&board).unwrap();
-            assert!(check_document(&del, "kicad_pcb").is_ok());
-            assert_eq!(collect_footprints(&del).len(), fps.len() - 1);
-            let (ws, _) = find_block_with_leading_whitespace(&original, before.start).unwrap();
-            assert!(original[ws..before.start].chars().all(char::is_whitespace), "{src}: delete reached into non-whitespace");
-            let expected = format!("{}{}", &original[..ws], &original[before.end..]);
-            assert_eq!(del, expected, "{src}: delete removed more than the block and its indent");
-        }
-        eprintln!("swept {total_fp} footprints");
-    }
-
-    fn fp_by_ref_scratch(content: &str, r: &str) -> BoardFootprint {
-        collect_footprints(content).into_iter().find(|f| f.reference.as_deref() == Some(r)).unwrap()
     }
 }

@@ -1747,6 +1747,13 @@ struct BoardZone {
     points: usize,
     bbox: Option<(f64, f64, f64, f64)>,
     filled: bool,
+    /// A `(keepout …)` zone is a rule area, not copper. It carries no net by
+    /// design, so it must never be reported as a netless pour — telling a
+    /// caller to "repair" one with set_zone_net would turn a keepout into a
+    /// copper pour and silently damage the board.
+    keepout: bool,
+    /// The zone's `(name "…")`, e.g. "ANT_KEEPOUT".
+    name: Option<String>,
 }
 
 impl BoardZone {
@@ -1761,6 +1768,12 @@ impl BoardZone {
             Some(_) => true,
             None => self.net_name.as_deref().is_some_and(|n| !n.is_empty()),
         }
+    }
+
+    /// Whether this is a copper pour that should be on a net but is not.
+    /// Keepouts are rule areas and are excluded.
+    fn is_orphaned_pour(&self) -> bool {
+        !self.keepout && !self.has_net()
     }
 
     /// The net this zone is on, or `None` when it is on none. The stale label
@@ -1816,6 +1829,8 @@ fn collect_zones(content: &str) -> Vec<BoardZone> {
             });
 
             Some(BoardZone {
+                keepout: node.find("keepout").is_some(),
+                name: node.find_str("name").map(str::to_string),
                 start,
                 end,
                 uuid: node.find_str("uuid").map(str::to_string),
@@ -2085,6 +2100,9 @@ fn zone_json(z: &BoardZone) -> serde_json::Value {
         // A pour on no net is copper connected to nothing. DRC does not flag
         // isolated copper, so this flag is the only warning there is.
         "has_net": z.has_net(),
+        // A keepout is a rule area, not copper; it carries no net by design.
+        "keepout": z.keepout,
+        "name": z.name,
         // The `(net_name …)` label as written, which on a net-less zone is the
         // net it was *meant* to be on.
         "net_label": z.net_label,
@@ -2116,9 +2134,11 @@ async fn handle_query_zones(
         })
         .collect();
 
+    // Keepouts are excluded: they legitimately have no net, and "repairing" one
+    // with set_zone_net would turn a rule area into a copper pour.
     let netless: Vec<String> = zones
         .iter()
-        .filter(|z| !z.has_net())
+        .filter(|z| z.is_orphaned_pour())
         .filter_map(|z| z.uuid.clone())
         .collect();
     let items: Vec<serde_json::Value> = zones.iter().map(zone_json).collect();
@@ -2168,6 +2188,21 @@ async fn handle_set_zone_net(
             "query_zones",
         )));
     };
+    // A keepout is a rule area, not copper. Giving it a net converts it into a
+    // pour — an antenna or connector clearance area silently becomes filled
+    // copper. Refuse rather than let a caller "repair" one.
+    if zone.keepout {
+        return Ok(CallToolResult::error(format!(
+            "Zone {uuid}{} is a keepout (rule area), not a copper pour. Keepouts \
+             carry no net by design; assigning one would turn it into copper. \
+             Use delete_zone if you meant to remove it.",
+            zone.name
+                .as_deref()
+                .map(|n| format!(" \"{n}\""))
+                .unwrap_or_default()
+        )));
+    }
+
     // The whole point of this tool is that a pour belongs to a real net, so an
     // unresolvable name is an error — never a fallback to net 0, which is the
     // defect being repaired.
@@ -3665,5 +3700,52 @@ mod via_zone_file_tests {
         let content = std::fs::read_to_string(&board).unwrap();
         check_document(&content, "kicad_pcb").unwrap();
         assert_eq!(content, kicad10_board());
+    }
+}
+
+#[cfg(test)]
+mod keepout_tests {
+    use super::*;
+
+    /// A real board carried `ANT_KEEPOUT`: a rule area spanning all four
+    /// copper layers with no `(net …)` at all. Keepouts carry no net by
+    /// design, so reporting one as a net-less pour tells a caller to "repair"
+    /// it — and assigning a net converts an antenna clearance area into filled
+    /// copper.
+    const BOARD: &str = "(kicad_pcb\n\t(version 20260206)\n\
+\t(zone\n\t\t(net \"GND\")\n\t\t(layer \"F.Cu\")\n\t\t(uuid \"pour-ok\")\n\
+\t\t(polygon (pts (xy 0 0) (xy 1 0) (xy 1 1)))\n\t)\n\
+\t(zone\n\t\t(net 0)\n\t\t(layer \"F.Cu\")\n\t\t(uuid \"pour-broken\")\n\
+\t\t(polygon (pts (xy 0 0) (xy 1 0) (xy 1 1)))\n\t)\n\
+\t(zone\n\t\t(layers \"F.Cu\" \"B.Cu\" \"In1.Cu\" \"In2.Cu\")\n\t\t(uuid \"ant-keepout\")\n\
+\t\t(name \"ANT_KEEPOUT\")\n\t\t(keepout\n\t\t\t(tracks allowed)\n\t\t\t(copperpour not_allowed)\n\t\t)\n\
+\t\t(polygon (pts (xy 0 0) (xy 1 0) (xy 1 1)))\n\t)\n)\n";
+
+    fn zone(uuid: &str) -> BoardZone {
+        collect_zones(BOARD)
+            .into_iter()
+            .find(|z| z.uuid.as_deref() == Some(uuid))
+            .expect(uuid)
+    }
+
+    #[test]
+    fn a_keepout_is_recognised_and_not_called_netless() {
+        let k = zone("ant-keepout");
+        assert!(k.keepout, "(keepout …) must be detected");
+        assert_eq!(k.name.as_deref(), Some("ANT_KEEPOUT"));
+        assert!(!k.has_net(), "it genuinely carries no net");
+        assert!(
+            !k.is_orphaned_pour(),
+            "but it is NOT a broken pour — flagging it would invite a caller to \
+             turn a rule area into copper"
+        );
+    }
+
+    #[test]
+    fn a_real_netless_pour_is_still_flagged() {
+        let broken = zone("pour-broken");
+        assert!(!broken.keepout);
+        assert!(broken.is_orphaned_pour(), "net 0 pour must still be reported");
+        assert!(!zone("pour-ok").is_orphaned_pour());
     }
 }
